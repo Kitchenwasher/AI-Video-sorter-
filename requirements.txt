@@ -1,11 +1,9 @@
-# ROCm wheel index for AMD GPU builds of PyTorch.
---extra-index-url https://download.pytorch.org/whl/rocm6.2
-
-torch==2.5.1+rocm6.2
-torchvision==0.20.1+rocm6.2
-facenet-pytorch>=2.6.0
+# Keep your existing PyTorch install (ROCm/CUDA/CPU) and install this file first:
+#   python -m pip install -r requirements.txt
+#
+# Then install facenet without dependency resolution so pip does not try to
+# replace a working ROCm torch/torchvision setup:
+#   python -m pip install facenet-pytorch==2.6.0 --no-deps
 opencv-python>=4.10.0.84
-numpy>=1.26,<2.1
-Pillow>=10.2.0,<10.3.0
 scikit-learn>=1.5.0
 tqdm>=4.66.4

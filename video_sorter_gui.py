@@ -188,9 +188,9 @@ class VideoSorterGUI:
 
     def _update_live_trace_button_text(self) -> None:
         if self.live_trace_var.get():
-            self.live_trace_button_var.set("Live Trace: On")
+            self.live_trace_button_var.set("Live Preview: On")
         else:
-            self.live_trace_button_var.set("Live Trace: Off")
+            self.live_trace_button_var.set("Live Preview: Off")
 
     def _toggle_include_generated(self) -> None:
         self.include_generated_var.set(not self.include_generated_var.get())

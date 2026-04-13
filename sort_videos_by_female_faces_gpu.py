@@ -105,6 +105,9 @@ MTCNN_MODEL: Optional[MTCNN] = None
 EMBED_MODEL: Optional[InceptionResnetV1] = None
 GENDER_NET: Optional[cv2.dnn_Net] = None
 ACTIVE_ACCELERATION = "CPU fallback"
+PREVIEW_ENABLED = True
+PREVIEW_WARNED = False
+PREVIEW_WINDOW_TITLE = "Live Frame Preview"
 
 
 def gpu_smoke_test() -> Tuple[bool, str]:
@@ -268,8 +271,9 @@ def resolve_gender_model_paths(cfg: Config) -> Tuple[Path, Path]:
 
 
 def init_worker(cfg: Config) -> None:
-    global CFG, DEVICE, MTCNN_MODEL, EMBED_MODEL, GENDER_NET, ACTIVE_ACCELERATION
+    global CFG, DEVICE, MTCNN_MODEL, EMBED_MODEL, GENDER_NET, ACTIVE_ACCELERATION, PREVIEW_ENABLED
     CFG = cfg
+    PREVIEW_ENABLED = cfg.max_workers == 1
 
     proto_path, model_path = resolve_gender_model_paths(cfg)
 
@@ -539,6 +543,50 @@ def emit_trace(video_name: str, phase: str, timestamp_sec: float, frame_index: i
     )
 
 
+def show_live_preview(
+    frame_bgr: Optional[np.ndarray],
+    video_name: str,
+    phase: str,
+    timestamp_sec: float,
+    frame_index: int,
+) -> None:
+    global PREVIEW_ENABLED, PREVIEW_WARNED
+
+    if CFG is None or not CFG.live_trace or not PREVIEW_ENABLED or frame_bgr is None:
+        return
+
+    try:
+        preview = frame_bgr.copy()
+        overlay = f"{phase} | {video_name} | {timestamp_sec:.2f}s | frame {frame_index}"
+        cv2.putText(
+            preview,
+            overlay,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.imshow(PREVIEW_WINDOW_TITLE, preview)
+        cv2.waitKey(1)
+    except Exception as exc:
+        PREVIEW_ENABLED = False
+        if not PREVIEW_WARNED:
+            PREVIEW_WARNED = True
+            print(f"[WARN] Live preview unavailable, using text trace only: {exc}", flush=True)
+
+
+def close_live_preview() -> None:
+    if not PREVIEW_ENABLED:
+        return
+    try:
+        cv2.destroyWindow(PREVIEW_WINDOW_TITLE)
+        cv2.waitKey(1)
+    except Exception:
+        pass
+
+
 def emit_progress(done: int, total: int, female: int, no_female: int, errors: int) -> None:
     print(
         f"[PROGRESS] done={done} total={total} female={female} no_female={no_female} errors={errors}",
@@ -626,6 +674,7 @@ def find_first_female(
             if frame_bgr is None:
                 continue
             frame_bgr = resize_frame(frame_bgr, cfg.resize_width)
+            show_live_preview(frame_bgr, video_name, "scan", timestamp_sec, frame_index)
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             valid_items.append((timestamp_sec, frame_index, frame_bgr, frame_rgb))
 
@@ -743,6 +792,7 @@ def stabilize_identity(
             if frame_bgr is None:
                 continue
             frame_bgr = resize_frame(frame_bgr, cfg.resize_width)
+            show_live_preview(frame_bgr, video_name, "stabilize", timestamp_sec, frame_index)
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             valid_items.append((timestamp_sec, frame_index, frame_bgr, frame_rgb))
 
@@ -951,7 +1001,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-trace",
         action="store_true",
-        help="Print live trace lines showing the current video and frame/timestamp being checked",
+        help="Show live frame preview while also printing trace lines with video/frame/timestamp",
     )
     parser.add_argument("--max-seconds", type=int, default=60, help="Only analyze the first N seconds")
     parser.add_argument("--sample-every-sec", type=float, default=2.0, help="Sparse scan interval in seconds")
@@ -1090,12 +1140,17 @@ def main() -> int:
     )
     if not videos:
         print(f"No videos found in {input_dir}")
+        close_live_preview()
         return 0
 
     print(f"Found {len(videos)} videos")
     print(f"Recursive child-folder scan: {cfg.recursive}")
     print(f"Include generated folders: {cfg.include_generated_folders}")
     print(f"Live trace enabled: {cfg.live_trace}")
+    if cfg.live_trace and cfg.max_workers > 1:
+        print("[WARN] Live frame preview is disabled when max-workers > 1; using text trace only.")
+    if torch.cuda.is_available() and cfg.max_workers == 1:
+        print("[HINT] GPU detected. Increase --max-workers (e.g. 2-4) to keep the GPU busier.")
     print(f"Using workers: {cfg.max_workers}")
     print(
         "Quality settings: "
@@ -1202,6 +1257,7 @@ def main() -> int:
     failed_results = [item for item in results if item.get("error")]
     if not successful_results:
         print("\n[ERROR] No videos were processed successfully, so nothing will be moved.")
+        close_live_preview()
         return 1
 
     cluster_map = cluster_embeddings(results, cfg.dbscan_eps, cfg.dbscan_min_samples)
@@ -1235,6 +1291,7 @@ def main() -> int:
     print(f"Moved videos: {moved_count}")
     print(f"Output directory: {output_dir}")
     print("===================")
+    close_live_preview()
     return 0
 
 
