@@ -1,0 +1,11 @@
+{
+  "source_folder": "/media/abhinav-sharma/Expansion/sorted",
+  "destination_folder": "/media/abhinav-sharma/Expansion/New folder",
+  "recursive": true,
+  "include_generated_folders": true,
+  "max_seconds": "60",
+  "sample_every_sec": "2.0",
+  "stabilization_seconds": "10",
+  "resize_width": "960",
+  "max_workers": "1"
+}
