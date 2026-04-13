@@ -77,6 +77,7 @@ class Config:
     max_seconds: int = 60
     sample_every_sec: float = 2.0
     resize_width: int = 960
+    detection_batch_size: int = 4
     stabilization_seconds: float = 8.0
     stabilization_sample_sec: float = 1.0
     female_confirmation_frames: int = 2
@@ -351,6 +352,31 @@ def read_frame_at(cap: cv2.VideoCapture, frame_index: int) -> Optional[np.ndarra
     return frame
 
 
+def read_frames_at_indices(cap: cv2.VideoCapture, frame_indices: Sequence[int]) -> Dict[int, Optional[np.ndarray]]:
+    if not frame_indices:
+        return {}
+
+    ordered = sorted(dict.fromkeys(int(idx) for idx in frame_indices))
+    frames: Dict[int, Optional[np.ndarray]] = {}
+
+    current_target = ordered[0]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, current_target)
+    ok, frame = cap.read()
+    frames[current_target] = frame if ok and frame is not None else None
+    current_pos = current_target
+
+    for target in ordered[1:]:
+        gap = max(0, target - current_pos - 1)
+        for _ in range(gap):
+            if not cap.grab():
+                break
+        ok, frame = cap.read()
+        frames[target] = frame if ok and frame is not None else None
+        current_pos = target
+
+    return frames
+
+
 def get_video_meta(cap: cv2.VideoCapture) -> Tuple[float, int, float]:
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0 or np.isnan(fps):
@@ -390,9 +416,14 @@ def crop_bgr(frame_bgr: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[
 
 
 def detect_faces(frame_rgb: np.ndarray) -> List[Dict[str, Any]]:
-    assert MTCNN_MODEL is not None
+    return _detect_faces_single(frame_rgb)
 
-    boxes, probs = MTCNN_MODEL.detect(Image.fromarray(frame_rgb))
+
+def _format_detections_for_frame(
+    boxes: Any,
+    probs: Any,
+    frame_rgb: np.ndarray,
+) -> List[Dict[str, Any]]:
     if boxes is None or probs is None:
         return []
 
@@ -415,6 +446,36 @@ def detect_faces(frame_rgb: np.ndarray) -> List[Dict[str, Any]]:
 
     detections.sort(key=lambda item: (item["area"] * item["prob"]), reverse=True)
     return detections
+
+
+def _detect_faces_single(frame_rgb: np.ndarray) -> List[Dict[str, Any]]:
+    assert MTCNN_MODEL is not None
+    boxes, probs = MTCNN_MODEL.detect(Image.fromarray(frame_rgb))
+    return _format_detections_for_frame(boxes, probs, frame_rgb)
+
+
+def detect_faces_batch(frames_rgb: Sequence[np.ndarray]) -> List[List[Dict[str, Any]]]:
+    assert MTCNN_MODEL is not None
+    if not frames_rgb:
+        return []
+
+    pil_frames = [Image.fromarray(frame) for frame in frames_rgb]
+    try:
+        boxes_batch, probs_batch = MTCNN_MODEL.detect(pil_frames if len(pil_frames) > 1 else pil_frames[0])
+    except Exception:
+        return [_detect_faces_single(frame) for frame in frames_rgb]
+
+    if len(frames_rgb) == 1 and not isinstance(boxes_batch, (list, tuple)):
+        boxes_seq = [boxes_batch]
+        probs_seq = [probs_batch]
+    else:
+        boxes_seq = boxes_batch
+        probs_seq = probs_batch
+
+    return [
+        _format_detections_for_frame(boxes, probs, frame_rgb)
+        for frame_rgb, boxes, probs in zip(frames_rgb, boxes_seq, probs_seq)
+    ]
 
 
 def classify_gender(face_bgr: np.ndarray) -> Tuple[str, float]:
@@ -550,54 +611,67 @@ def find_first_female(
     cfg: Config,
     video_name: str,
 ) -> Tuple[Optional[float], Optional[Tuple[int, int, int, int]], Optional[np.ndarray]]:
-    for timestamp_sec in build_sample_times(scan_duration, cfg.sample_every_sec):
-        frame_index = timestamp_to_frame_index(timestamp_sec, fps, total_frames)
-        emit_trace(video_name, "scan", timestamp_sec, frame_index)
-        frame_bgr = read_frame_at(cap, frame_index)
-        if frame_bgr is None:
+    sample_times = build_sample_times(scan_duration, cfg.sample_every_sec)
+    sample_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
+
+    for start in range(0, len(sample_times), cfg.detection_batch_size):
+        chunk_times = sample_times[start : start + cfg.detection_batch_size]
+        chunk_indices = sample_indices[start : start + cfg.detection_batch_size]
+        frame_map = read_frames_at_indices(cap, chunk_indices)
+
+        valid_items: List[Tuple[float, int, np.ndarray, np.ndarray]] = []
+        for timestamp_sec, frame_index in zip(chunk_times, chunk_indices):
+            emit_trace(video_name, "scan", timestamp_sec, frame_index)
+            frame_bgr = frame_map.get(frame_index)
+            if frame_bgr is None:
+                continue
+            frame_bgr = resize_frame(frame_bgr, cfg.resize_width)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            valid_items.append((timestamp_sec, frame_index, frame_bgr, frame_rgb))
+
+        if not valid_items:
             continue
 
-        frame_bgr = resize_frame(frame_bgr, cfg.resize_width)
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        faces = detect_faces(frame_rgb)
-        if not faces:
-            continue
-
-        checked = 0
-        for face in faces:
-            if face["prob"] < cfg.detection_confidence:
-                continue
-            if checked >= cfg.max_faces_per_frame:
-                break
-            checked += 1
-
-            expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
-            face_bgr = crop_bgr(frame_bgr, expanded)
-            if face_bgr is None:
+        detections_batch = detect_faces_batch([item[3] for item in valid_items])
+        for (timestamp_sec, _frame_index, frame_bgr, _frame_rgb), faces in zip(valid_items, detections_batch):
+            if not faces:
                 continue
 
-            gender_label, gender_conf = classify_gender(face_bgr)
-            if gender_label.lower() != "female" or gender_conf < cfg.min_female_gender_confidence:
-                continue
+            checked = 0
+            for face in faces:
+                if face["prob"] < cfg.detection_confidence:
+                    continue
+                if checked >= cfg.max_faces_per_frame:
+                    break
+                checked += 1
 
-            face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-            emb_batch = embed_faces([face_rgb])
-            if len(emb_batch) == 0:
-                continue
+                expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
+                face_bgr = crop_bgr(frame_bgr, expanded)
+                if face_bgr is None:
+                    continue
 
-            if not verify_female_candidate(
-                cap=cap,
-                fps=fps,
-                total_frames=total_frames,
-                scan_duration=scan_duration,
-                first_ts=timestamp_sec,
-                first_embedding=emb_batch[0],
-                cfg=cfg,
-            ):
-                continue
+                gender_label, gender_conf = classify_gender(face_bgr)
+                if gender_label.lower() != "female" or gender_conf < cfg.min_female_gender_confidence:
+                    continue
 
-            print(f"[SCAN] first female at {timestamp_sec:.1f}s (gender_conf={gender_conf:.3f})", flush=True)
-            return timestamp_sec, expanded, emb_batch[0]
+                face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+                emb_batch = embed_faces([face_rgb])
+                if len(emb_batch) == 0:
+                    continue
+
+                if not verify_female_candidate(
+                    cap=cap,
+                    fps=fps,
+                    total_frames=total_frames,
+                    scan_duration=scan_duration,
+                    first_ts=timestamp_sec,
+                    first_embedding=emb_batch[0],
+                    cfg=cfg,
+                ):
+                    continue
+
+                print(f"[SCAN] first female at {timestamp_sec:.1f}s (gender_conf={gender_conf:.3f})", flush=True)
+                return timestamp_sec, expanded, emb_batch[0]
 
     return None, None, None
 
@@ -653,46 +727,58 @@ def stabilize_identity(
     last_kept = first_embedding.copy()
     current_box = first_box
 
-    sample_times = build_sample_times(end_ts - first_ts, cfg.stabilization_sample_sec)
-    for offset_sec in sample_times[1:]:
-        timestamp_sec = first_ts + offset_sec
-        frame_index = timestamp_to_frame_index(timestamp_sec, fps, total_frames)
-        emit_trace(video_name, "stabilize", timestamp_sec, frame_index)
-        frame_bgr = read_frame_at(cap, frame_index)
-        if frame_bgr is None:
+    sample_offsets = build_sample_times(end_ts - first_ts, cfg.stabilization_sample_sec)[1:]
+    sample_times = [first_ts + offset_sec for offset_sec in sample_offsets]
+    sample_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
+
+    for start in range(0, len(sample_times), cfg.detection_batch_size):
+        chunk_times = sample_times[start : start + cfg.detection_batch_size]
+        chunk_indices = sample_indices[start : start + cfg.detection_batch_size]
+        frame_map = read_frames_at_indices(cap, chunk_indices)
+
+        valid_items: List[Tuple[float, int, np.ndarray, np.ndarray]] = []
+        for timestamp_sec, frame_index in zip(chunk_times, chunk_indices):
+            emit_trace(video_name, "stabilize", timestamp_sec, frame_index)
+            frame_bgr = frame_map.get(frame_index)
+            if frame_bgr is None:
+                continue
+            frame_bgr = resize_frame(frame_bgr, cfg.resize_width)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            valid_items.append((timestamp_sec, frame_index, frame_bgr, frame_rgb))
+
+        if not valid_items:
             continue
 
-        frame_bgr = resize_frame(frame_bgr, cfg.resize_width)
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        faces = detect_faces(frame_rgb)
-        if not faces:
-            continue
+        detections_batch = detect_faces_batch([item[3] for item in valid_items])
+        for (_timestamp_sec, _frame_index, frame_bgr, _frame_rgb), faces in zip(valid_items, detections_batch):
+            if not faces:
+                continue
 
-        matched_embedding, matched_box, similarity = select_best_matching_face(
-            frame_bgr=frame_bgr,
-            faces=faces,
-            reference_embedding=running_reference,
-            cfg=cfg,
-        )
-        if matched_embedding is None or matched_box is None:
-            continue
-        if similarity < cfg.same_person_threshold:
-            continue
+            matched_embedding, matched_box, similarity = select_best_matching_face(
+                frame_bgr=frame_bgr,
+                faces=faces,
+                reference_embedding=running_reference,
+                cfg=cfg,
+            )
+            if matched_embedding is None or matched_box is None:
+                continue
+            if similarity < cfg.same_person_threshold:
+                continue
 
-        box_center_shift = abs((matched_box[0] + matched_box[2]) - (current_box[0] + current_box[2])) + abs(
-            (matched_box[1] + matched_box[3]) - (current_box[1] + current_box[3])
-        )
-        if box_center_shift > max(frame_bgr.shape[:2]) * 0.8:
-            continue
+            box_center_shift = abs((matched_box[0] + matched_box[2]) - (current_box[0] + current_box[2])) + abs(
+                (matched_box[1] + matched_box[3]) - (current_box[1] + current_box[3])
+            )
+            if box_center_shift > max(frame_bgr.shape[:2]) * 0.8:
+                continue
 
-        if cosine_similarity(last_kept, matched_embedding) >= cfg.duplicate_threshold:
-            continue
+            if cosine_similarity(last_kept, matched_embedding) >= cfg.duplicate_threshold:
+                continue
 
-        kept_embeddings.append(matched_embedding)
-        last_kept = matched_embedding
-        current_box = matched_box
-        running_reference = np.mean(np.vstack(kept_embeddings), axis=0).astype(np.float32)
-        running_reference /= np.linalg.norm(running_reference) + 1e-8
+            kept_embeddings.append(matched_embedding)
+            last_kept = matched_embedding
+            current_box = matched_box
+            running_reference = np.mean(np.vstack(kept_embeddings), axis=0).astype(np.float32)
+            running_reference /= np.linalg.norm(running_reference) + 1e-8
 
     return kept_embeddings
 
@@ -871,6 +957,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-every-sec", type=float, default=2.0, help="Sparse scan interval in seconds")
     parser.add_argument("--resize-width", type=int, default=960, help="Resize frames to this max width")
     parser.add_argument(
+        "--detection-batch-size",
+        type=int,
+        default=4,
+        help="How many sampled frames to batch together for GPU face detection",
+    )
+    parser.add_argument(
         "--stabilization-seconds",
         type=float,
         default=8.0,
@@ -965,6 +1057,7 @@ def main() -> int:
         max_seconds=args.max_seconds,
         sample_every_sec=args.sample_every_sec,
         resize_width=args.resize_width,
+        detection_batch_size=max(1, args.detection_batch_size),
         stabilization_seconds=args.stabilization_seconds,
         stabilization_sample_sec=args.stabilization_sample_sec,
         female_confirmation_frames=max(1, args.female_confirmation_frames),
@@ -1008,6 +1101,7 @@ def main() -> int:
         "Quality settings: "
         f"confirm_frames={cfg.female_confirmation_frames}, "
         f"min_stable_embeddings={cfg.min_stable_embeddings}, "
+        f"detection_batch_size={cfg.detection_batch_size}, "
         f"dbscan_eps={cfg.dbscan_eps}, "
         f"cluster_merge_threshold={cfg.cluster_merge_threshold}"
     )
