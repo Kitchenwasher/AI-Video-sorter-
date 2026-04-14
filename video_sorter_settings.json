@@ -1,8 +1,10 @@
 {
-  "source_folder": "/media/abhinav-sharma/Expansion/sorted",
-  "destination_folder": "/media/abhinav-sharma/Expansion/New folder",
+  "source_folder": "D:/New folder/No_Female_Found",
+  "destination_folder": "D:/sorted",
   "recursive": true,
   "include_generated_folders": true,
+  "review_mode": true,
+  "live_trace": false,
   "max_seconds": "60",
   "sample_every_sec": "2.0",
   "stabilization_seconds": "10",

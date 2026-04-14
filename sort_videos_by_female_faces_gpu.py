@@ -39,8 +39,10 @@ import subprocess
 import sys
 import traceback
 import urllib.request
+import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -52,6 +54,20 @@ from facenet_pytorch import InceptionResnetV1, MTCNN
 from PIL import Image
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm
+
+from folder_naming import build_cluster_folder_names, sanitize_folder_name
+from learning_memory import default_memory_path, load_memory, match_identity, record_feedback, save_memory
+from review_queue import (
+    REVIEW_PENDING_DIRNAME,
+    REVIEW_STATE_DIRNAME,
+    apply_review_action,
+    create_review_state,
+    decide_review_route,
+    load_review_state,
+    pending_review_items,
+    review_state_path,
+    save_review_state,
+)
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -70,6 +86,12 @@ GENDER_MEAN = (78.4263377603, 87.7689143744, 114.895847746)
 class Config:
     input_dir: str
     output_dir: str
+    review_mode: bool = False
+    learning_enabled: bool = True
+    learning_memory_file: str = ""
+    learning_auto_threshold: float = 0.82
+    learning_suggest_threshold: float = 0.74
+    stop_flag_file: str = ""
     recursive: bool = True
     include_generated_folders: bool = False
     live_trace: bool = False
@@ -83,7 +105,10 @@ class Config:
     female_confirmation_frames: int = 2
     female_confirmation_window_sec: float = 2.5
     min_female_gender_confidence: float = 0.65
+    min_female_vote_ratio: float = 0.62
+    min_face_area_ratio: float = 0.018
     min_stable_embeddings: int = 3
+    min_stabilization_gender_votes: int = 3
     mtcnn_min_face_size: int = 48
     mtcnn_margin_px: int = 16
     max_faces_per_frame: int = 4
@@ -108,6 +133,10 @@ ACTIVE_ACCELERATION = "CPU fallback"
 PREVIEW_ENABLED = True
 PREVIEW_WARNED = False
 PREVIEW_WINDOW_TITLE = "Live Frame Preview"
+
+
+class StopRequestedError(Exception):
+    pass
 
 
 def gpu_smoke_test() -> Tuple[bool, str]:
@@ -327,6 +356,8 @@ def list_videos(input_dir: str, recursive: bool = True, include_generated_folder
             continue
         rel_parts = path.relative_to(root).parts
         rel_parts_set = set(rel_parts)
+        if REVIEW_STATE_DIRNAME in rel_parts_set or REVIEW_PENDING_DIRNAME in rel_parts_set:
+            continue
         if not include_generated_folders:
             if ".model_cache" in rel_parts_set or "No_Female_Found" in rel_parts_set:
                 continue
@@ -417,6 +448,13 @@ def crop_bgr(frame_bgr: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[
     if crop.size == 0:
         return None
     return crop
+
+
+def face_area_ratio(box: Tuple[int, int, int, int], frame_bgr: np.ndarray) -> float:
+    x1, y1, x2, y2 = box
+    face_area = max(0, x2 - x1) * max(0, y2 - y1)
+    frame_area = max(1, frame_bgr.shape[0] * frame_bgr.shape[1])
+    return float(face_area) / float(frame_area)
 
 
 def detect_faces(frame_rgb: np.ndarray) -> List[Dict[str, Any]]:
@@ -543,6 +581,20 @@ def emit_trace(video_name: str, phase: str, timestamp_sec: float, frame_index: i
     )
 
 
+def stop_requested() -> bool:
+    if CFG is None:
+        return False
+    flag = str(CFG.stop_flag_file or "").strip()
+    if not flag:
+        return False
+    return Path(flag).exists()
+
+
+def ensure_not_stopped() -> None:
+    if stop_requested():
+        raise StopRequestedError("Stop requested")
+
+
 def show_live_preview(
     frame_bgr: Optional[np.ndarray],
     video_name: str,
@@ -614,10 +666,18 @@ def verify_female_candidate(
     first_ts: float,
     first_embedding: np.ndarray,
     cfg: Config,
-) -> bool:
-    confirmations = 1
+    initial_gender_label: str,
+    initial_gender_conf: float,
+) -> Tuple[bool, float, float, int]:
+    ensure_not_stopped()
+    female_score = initial_gender_conf if initial_gender_label.lower() == "female" else 0.0
+    male_score = initial_gender_conf if initial_gender_label.lower() == "male" else 0.0
+    female_votes = 1 if initial_gender_label.lower() == "female" else 0
+    votes = 1
+
     step = max(0.5, cfg.female_confirmation_window_sec / max(1, cfg.female_confirmation_frames))
     for idx in range(1, cfg.female_confirmation_frames):
+        ensure_not_stopped()
         ts = first_ts + (idx * step)
         if ts > scan_duration:
             break
@@ -644,11 +704,37 @@ def verify_female_candidate(
         face_bgr = crop_bgr(frame_bgr, matched_box)
         if face_bgr is None:
             continue
-        gender_label, gender_conf = classify_gender(face_bgr)
-        if gender_label.lower() == "female" and gender_conf >= cfg.min_female_gender_confidence:
-            confirmations += 1
+        if face_area_ratio(matched_box, frame_bgr) < cfg.min_face_area_ratio:
+            continue
 
-    return confirmations >= cfg.female_confirmation_frames
+        gender_label, gender_conf = classify_gender(face_bgr)
+        votes += 1
+        if gender_label.lower() == "female":
+            female_score += gender_conf
+            if gender_conf >= cfg.min_female_gender_confidence:
+                female_votes += 1
+        else:
+            male_score += gender_conf
+
+    if votes < cfg.female_confirmation_frames:
+        return False, female_score, male_score, votes
+
+    min_female_votes = max(2, cfg.female_confirmation_frames - 1)
+    if female_votes < min_female_votes:
+        return False, female_score, male_score, votes
+
+    total_score = female_score + male_score
+    if total_score <= 0:
+        return False, female_score, male_score, votes
+
+    female_ratio = female_score / total_score
+    if female_ratio < cfg.min_female_vote_ratio:
+        return False, female_score, male_score, votes
+
+    if female_score <= male_score:
+        return False, female_score, male_score, votes
+
+    return True, female_score, male_score, votes
 
 
 def find_first_female(
@@ -658,11 +744,21 @@ def find_first_female(
     scan_duration: float,
     cfg: Config,
     video_name: str,
-) -> Tuple[Optional[float], Optional[Tuple[int, int, int, int]], Optional[np.ndarray]]:
+) -> Tuple[
+    Optional[float],
+    Optional[Tuple[int, int, int, int]],
+    Optional[np.ndarray],
+    Optional[str],
+    Optional[float],
+    Dict[str, Any],
+]:
     sample_times = build_sample_times(scan_duration, cfg.sample_every_sec)
     sample_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
+    female_seed_hits = 0
+    best_seed_conf = 0.0
 
     for start in range(0, len(sample_times), cfg.detection_batch_size):
+        ensure_not_stopped()
         chunk_times = sample_times[start : start + cfg.detection_batch_size]
         chunk_indices = sample_indices[start : start + cfg.detection_batch_size]
         frame_map = read_frames_at_indices(cap, chunk_indices)
@@ -695,6 +791,8 @@ def find_first_female(
                 checked += 1
 
                 expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
+                if face_area_ratio(expanded, frame_bgr) < cfg.min_face_area_ratio:
+                    continue
                 face_bgr = crop_bgr(frame_bgr, expanded)
                 if face_bgr is None:
                     continue
@@ -702,13 +800,15 @@ def find_first_female(
                 gender_label, gender_conf = classify_gender(face_bgr)
                 if gender_label.lower() != "female" or gender_conf < cfg.min_female_gender_confidence:
                     continue
+                female_seed_hits += 1
+                best_seed_conf = max(best_seed_conf, float(gender_conf))
 
                 face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
                 emb_batch = embed_faces([face_rgb])
                 if len(emb_batch) == 0:
                     continue
 
-                if not verify_female_candidate(
+                verified, female_score, male_score, vote_count = verify_female_candidate(
                     cap=cap,
                     fps=fps,
                     total_frames=total_frames,
@@ -716,13 +816,41 @@ def find_first_female(
                     first_ts=timestamp_sec,
                     first_embedding=emb_batch[0],
                     cfg=cfg,
-                ):
+                    initial_gender_label=gender_label,
+                    initial_gender_conf=gender_conf,
+                )
+                if not verified:
                     continue
 
-                print(f"[SCAN] first female at {timestamp_sec:.1f}s (gender_conf={gender_conf:.3f})", flush=True)
-                return timestamp_sec, expanded, emb_batch[0]
+                print(
+                    f"[SCAN] first female at {timestamp_sec:.1f}s "
+                    f"(seed_conf={gender_conf:.3f}, female_score={female_score:.3f}, "
+                    f"male_score={male_score:.3f}, votes={vote_count})",
+                    flush=True,
+                )
+                return (
+                    timestamp_sec,
+                    expanded,
+                    emb_batch[0],
+                    gender_label,
+                    gender_conf,
+                    {
+                        "female_seed_hits": female_seed_hits,
+                        "best_seed_confidence": best_seed_conf,
+                    },
+                )
 
-    return None, None, None
+    return (
+        None,
+        None,
+        None,
+        None,
+        None,
+        {
+            "female_seed_hits": female_seed_hits,
+            "best_seed_confidence": best_seed_conf,
+        },
+    )
 
 
 def select_best_matching_face(
@@ -738,6 +866,8 @@ def select_best_matching_face(
         if face["prob"] < cfg.detection_confidence:
             continue
         expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
+        if face_area_ratio(expanded, frame_bgr) < cfg.min_face_area_ratio:
+            continue
         crop = crop_bgr(frame_bgr, expanded)
         if crop is None:
             continue
@@ -764,14 +894,22 @@ def stabilize_identity(
     first_ts: float,
     first_box: Tuple[int, int, int, int],
     first_embedding: np.ndarray,
+    initial_gender_label: str,
+    initial_gender_conf: float,
     cfg: Config,
     video_name: str,
-) -> List[np.ndarray]:
+) -> Tuple[List[np.ndarray], float, float, int]:
+    ensure_not_stopped()
     end_ts = min(scan_duration, first_ts + cfg.stabilization_seconds)
     if end_ts <= first_ts:
-        return [first_embedding]
+        female_score = initial_gender_conf if initial_gender_label.lower() == "female" else 0.0
+        male_score = initial_gender_conf if initial_gender_label.lower() == "male" else 0.0
+        return [first_embedding], female_score, male_score, 1
 
     kept_embeddings: List[np.ndarray] = [first_embedding]
+    female_score = initial_gender_conf if initial_gender_label.lower() == "female" else 0.0
+    male_score = initial_gender_conf if initial_gender_label.lower() == "male" else 0.0
+    gender_votes = 1
     running_reference = first_embedding.copy()
     last_kept = first_embedding.copy()
     current_box = first_box
@@ -781,6 +919,7 @@ def stabilize_identity(
     sample_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
 
     for start in range(0, len(sample_times), cfg.detection_batch_size):
+        ensure_not_stopped()
         chunk_times = sample_times[start : start + cfg.detection_batch_size]
         chunk_indices = sample_indices[start : start + cfg.detection_batch_size]
         frame_map = read_frames_at_indices(cap, chunk_indices)
@@ -824,13 +963,122 @@ def stabilize_identity(
             if cosine_similarity(last_kept, matched_embedding) >= cfg.duplicate_threshold:
                 continue
 
+            face_bgr = crop_bgr(frame_bgr, matched_box)
+            if face_bgr is not None:
+                gender_label, gender_conf = classify_gender(face_bgr)
+                gender_votes += 1
+                if gender_label.lower() == "female":
+                    female_score += gender_conf
+                else:
+                    male_score += gender_conf
+
             kept_embeddings.append(matched_embedding)
             last_kept = matched_embedding
             current_box = matched_box
             running_reference = np.mean(np.vstack(kept_embeddings), axis=0).astype(np.float32)
             running_reference /= np.linalg.norm(running_reference) + 1e-8
 
-    return kept_embeddings
+    return kept_embeddings, female_score, male_score, gender_votes
+
+
+def clamp_confidence(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def set_decision(result: Dict[str, Any], label: str, reason: str, confidence: float) -> None:
+    result["decision_label"] = label
+    result["decision_reason"] = reason
+    result["confidence_score"] = round(clamp_confidence(confidence), 3)
+
+
+def memory_file_path(cfg: Config) -> Path:
+    explicit = str(cfg.learning_memory_file or "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return default_memory_path(Path(__file__).resolve().parent)
+
+
+def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Config) -> None:
+    result["memory_match_label"] = ""
+    result["memory_match_score"] = 0.0
+    result["memory_applied"] = False
+    result.setdefault("memory_suggestion", "")
+
+    if not cfg.learning_enabled:
+        return
+
+    embedding = result.get("embedding")
+    if not isinstance(embedding, list) or not embedding:
+        return
+
+    match = match_identity(memory, embedding)
+    if not match:
+        return
+
+    label = str(match.get("label", "")).strip()
+    score = float(match.get("score", 0.0))
+    if not label:
+        return
+
+    result["memory_match_label"] = label
+    result["memory_match_score"] = round(score, 4)
+    result["memory_suggestion"] = label
+
+    base_label = str(result.get("decision_label", "")).strip().lower()
+    base_conf = float(result.get("confidence_score", 0.0))
+
+    if score >= cfg.learning_auto_threshold:
+        confidence_gap_clear = (score - base_conf) >= 0.18 or base_conf < 0.65
+        if base_label == "female_detected" or confidence_gap_clear:
+            result["memory_applied"] = True
+            result["female_found"] = True
+            result["suggested_folder_name"] = label
+            set_decision(
+                result,
+                "female_detected",
+                f"Applied learned identity memory match: {label} (score={score:.3f}).",
+                max(base_conf, score),
+            )
+            return
+
+    if score >= cfg.learning_suggest_threshold:
+        result["suggested_folder_name"] = label
+        result["female_found"] = False
+        result["suggested_cluster_id"] = None
+        set_decision(
+            result,
+            "uncertain",
+            f"Memory suggests {label} (score={score:.3f}) but confidence is below auto-apply threshold.",
+            max(base_conf, min(0.8, score)),
+        )
+
+
+def update_learning_from_review_item(
+    updated_item: Dict[str, Any],
+    memory: Dict[str, Any],
+) -> bool:
+    action = str(updated_item.get("review_action", "")).strip().lower()
+    if action not in {"approve_suggested", "move_no_female", "reassign_existing", "reassign_new"}:
+        return False
+
+    final_path = Path(str(updated_item.get("final_path", "")).strip())
+    final_label = str(updated_item.get("final_label", "")).strip() or final_path.parent.name
+    if not final_label:
+        return False
+
+    record_feedback(
+        memory,
+        action=action,
+        label=final_label,
+        predicted_label=str(updated_item.get("predicted_label", "")),
+        confidence=float(updated_item.get("confidence", 0.0)),
+        source_path=str(updated_item.get("source_path", "")),
+        final_path=str(final_path),
+        embedding=updated_item.get("embedding"),
+        memory_match_label=str(updated_item.get("memory_match_label", "")),
+        memory_match_score=float(updated_item.get("memory_match_score", 0.0)),
+    )
+    return True
 
 
 def process_video(video_path: str) -> Dict[str, Any]:
@@ -845,23 +1093,36 @@ def process_video(video_path: str) -> Dict[str, Any]:
         "female_found": False,
         "embedding": None,
         "error": None,
+        "stopped": False,
         "samples_used": 0,
         "device": ACTIVE_ACCELERATION,
+        "decision_label": "unknown",
+        "decision_reason": "",
+        "confidence_score": 0.0,
+        "suggested_cluster_id": None,
+        "suggested_folder_name": "",
+        "memory_match_label": "",
+        "memory_match_score": 0.0,
+        "memory_applied": False,
+        "memory_suggestion": "",
     }
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         result["error"] = "Failed to open video"
+        set_decision(result, "error", "Failed to open video", 0.0)
         return result
 
     try:
+        ensure_not_stopped()
         fps, total_frames, duration_sec = get_video_meta(cap)
         if total_frames <= 0:
             result["error"] = "Invalid or empty video"
+            set_decision(result, "error", "Invalid or empty video", 0.0)
             return result
 
         scan_duration = min(float(cfg.max_seconds), duration_sec if duration_sec > 0 else float(cfg.max_seconds))
-        first_ts, first_box, first_embedding = find_first_female(
+        first_ts, first_box, first_embedding, first_gender_label, first_gender_conf, scan_info = find_first_female(
             cap,
             fps,
             total_frames,
@@ -869,11 +1130,33 @@ def process_video(video_path: str) -> Dict[str, Any]:
             cfg,
             video_name,
         )
-        if first_ts is None or first_box is None or first_embedding is None:
-            print(f"[NO FEMALE] {video_name}", flush=True)
+        if (
+            first_ts is None
+            or first_box is None
+            or first_embedding is None
+            or first_gender_label is None
+            or first_gender_conf is None
+        ):
+            seed_hits = int(scan_info.get("female_seed_hits", 0))
+            best_seed_conf = float(scan_info.get("best_seed_confidence", 0.0))
+            if seed_hits > 0:
+                set_decision(
+                    result,
+                    "uncertain",
+                    f"Female-like candidates found ({seed_hits}) but none verified across confirmation frames.",
+                    0.35 + min(0.25, best_seed_conf * 0.3),
+                )
+                print(
+                    f"[UNCERTAIN] {video_name} female candidates found but not verified "
+                    f"(seed_hits={seed_hits}, best_seed_conf={best_seed_conf:.3f})",
+                    flush=True,
+                )
+            else:
+                set_decision(result, "no_female", "No meaningful female candidate evidence detected.", 0.9)
+                print(f"[NO FEMALE] {video_name}", flush=True)
             return result
 
-        kept_embeddings = stabilize_identity(
+        kept_embeddings, female_score, male_score, gender_votes = stabilize_identity(
             cap=cap,
             fps=fps,
             total_frames=total_frames,
@@ -881,35 +1164,90 @@ def process_video(video_path: str) -> Dict[str, Any]:
             first_ts=first_ts,
             first_box=first_box,
             first_embedding=first_embedding,
+            initial_gender_label=first_gender_label,
+            initial_gender_conf=first_gender_conf,
             cfg=cfg,
             video_name=video_name,
         )
         if not kept_embeddings:
-            print(f"[NO STABLE ID] {video_name}", flush=True)
+            set_decision(result, "uncertain", "Female candidate detected but identity could not be stabilized.", 0.4)
+            print(f"[UNCERTAIN] {video_name} no stable identity", flush=True)
             return result
 
         if len(kept_embeddings) < cfg.min_stable_embeddings:
-            print(f"[LOW CONFIDENCE] {video_name} only {len(kept_embeddings)} stable embeddings", flush=True)
+            set_decision(
+                result,
+                "uncertain",
+                f"Low stabilization evidence: only {len(kept_embeddings)} stable embeddings.",
+                0.45,
+            )
+            print(f"[UNCERTAIN] {video_name} only {len(kept_embeddings)} stable embeddings", flush=True)
             return result
+
+        if gender_votes < cfg.min_stabilization_gender_votes:
+            set_decision(
+                result,
+                "uncertain",
+                f"Low stabilization evidence: only {gender_votes} gender votes.",
+                0.45,
+            )
+            print(f"[UNCERTAIN] {video_name} only {gender_votes} gender votes during stabilization", flush=True)
+            return result
+
+        total_gender_score = female_score + male_score
+        female_ratio = 0.0
+        if total_gender_score > 0:
+            female_ratio = female_score / total_gender_score
+            if female_ratio < cfg.min_female_vote_ratio or female_score <= male_score:
+                stable_embedding = robust_average_embeddings(kept_embeddings)
+                result["embedding"] = stable_embedding.tolist()
+                result["samples_used"] = len(kept_embeddings)
+                set_decision(
+                    result,
+                    "uncertain",
+                    (
+                        "Conflicting gender votes during stabilization "
+                        f"(female_score={female_score:.3f}, male_score={male_score:.3f})."
+                    ),
+                    0.5,
+                )
+                print(
+                    f"[UNCERTAIN] {video_name} gender votes disagree "
+                    f"(female_score={female_score:.3f}, male_score={male_score:.3f}, ratio={female_ratio:.3f})",
+                    flush=True,
+                )
+                return result
 
         stable_embedding = robust_average_embeddings(kept_embeddings)
 
         result["female_found"] = True
         result["embedding"] = stable_embedding.tolist()
         result["samples_used"] = len(kept_embeddings)
+        set_decision(
+            result,
+            "female_detected",
+            "Consistent female detection and stabilized identity track.",
+            0.45 + (0.25 * min(1.0, len(kept_embeddings) / max(1, cfg.min_stable_embeddings))) + (0.30 * female_ratio),
+        )
 
         print(
-            f"[FEMALE FOUND] {video_name} at {first_ts:.1f}s with {len(kept_embeddings)} stable embeddings",
+            f"[FEMALE FOUND] {video_name} at {first_ts:.1f}s with {len(kept_embeddings)} stable embeddings "
+            f"(female_score={female_score:.3f}, male_score={male_score:.3f}, votes={gender_votes})",
             flush=True,
         )
         return result
 
+    except StopRequestedError:
+        result["stopped"] = True
+        set_decision(result, "stopped", "Processing stopped by user request.", 0.0)
+        print(f"[STOPPED] {video_name}", flush=True)
+        return result
     except Exception as exc:
         result["error"] = f"{exc}\n{traceback.format_exc()}"
+        set_decision(result, "error", f"Processing failure: {exc}", 0.0)
         return result
     finally:
         cap.release()
-
 
 def cluster_embeddings(video_results: Sequence[Dict[str, Any]], eps: float, min_samples: int) -> Dict[str, int]:
     vectors: List[np.ndarray] = []
@@ -981,8 +1319,8 @@ def move_video(src: Path, dst_dir: Path) -> Path:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sort videos by female identity using facenet-pytorch on ROCm")
-    parser.add_argument("--input-dir", required=True, help="Directory containing source videos")
-    parser.add_argument("--output-dir", required=True, help="Directory to place sorted videos")
+    parser.add_argument("--input-dir", default=".", help="Directory containing source videos")
+    parser.add_argument("--output-dir", default=".", help="Directory to place sorted videos")
     parser.add_argument(
         "--print-runtime-json",
         action="store_true",
@@ -997,6 +1335,58 @@ def parse_args() -> argparse.Namespace:
         "--include-generated-folders",
         action="store_true",
         help="Also scan videos inside generated folders such as Female_* and No_Female_Found",
+    )
+    parser.add_argument(
+        "--review-mode",
+        action="store_true",
+        help="Route female_detected and uncertain videos to Review_Pending and write review queue state",
+    )
+    parser.add_argument(
+        "--review-list-json",
+        action="store_true",
+        help="Print review queue state JSON for --output-dir and exit",
+    )
+    parser.add_argument(
+        "--review-action",
+        default="",
+        help="Apply one review action: approve_suggested, move_no_female, reassign_existing, reassign_new, skip",
+    )
+    parser.add_argument("--review-item-id", default="", help="Review item id for --review-action")
+    parser.add_argument("--review-target-folder", default="", help="Target folder for reassign review actions")
+    parser.add_argument(
+        "--learning-enabled",
+        dest="learning_enabled",
+        action="store_true",
+        default=True,
+        help="Enable memory-assisted learning from manual reviews (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-learning-enabled",
+        dest="learning_enabled",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--learning-memory-file",
+        default="",
+        help="Optional path to global learning memory JSON file",
+    )
+    parser.add_argument(
+        "--learning-auto-threshold",
+        type=float,
+        default=0.82,
+        help="Auto-apply memory label when cosine similarity is at least this value",
+    )
+    parser.add_argument(
+        "--learning-suggest-threshold",
+        type=float,
+        default=0.74,
+        help="Mark uncertain with memory suggestion when similarity is at least this value",
+    )
+    parser.add_argument(
+        "--stop-flag-file",
+        default="",
+        help="Path to a flag file. If the file appears, processing stops gracefully and moves completed work.",
     )
     parser.add_argument(
         "--live-trace",
@@ -1043,10 +1433,28 @@ def parse_args() -> argparse.Namespace:
         help="Minimum OpenCV gender confidence required for a female match",
     )
     parser.add_argument(
+        "--min-female-vote-ratio",
+        type=float,
+        default=0.62,
+        help="Minimum female confidence ratio (female_score / total_gender_score) across confirmations",
+    )
+    parser.add_argument(
+        "--min-face-area-ratio",
+        type=float,
+        default=0.018,
+        help="Ignore tiny faces below this fraction of the frame area",
+    )
+    parser.add_argument(
         "--min-stable-embeddings",
         type=int,
         default=3,
         help="Require at least this many same-person embeddings before accepting a video identity",
+    )
+    parser.add_argument(
+        "--min-stabilization-gender-votes",
+        type=int,
+        default=3,
+        help="Require at least this many stabilization gender votes before accepting the video",
     )
     parser.add_argument("--max-faces-per-frame", type=int, default=4, help="Limit faces checked per frame")
     parser.add_argument("--detection-confidence", type=float, default=0.90, help="Minimum MTCNN face confidence")
@@ -1083,13 +1491,67 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    output_dir = Path(args.output_dir).expanduser().resolve()
 
     if args.print_runtime_json:
         print(json.dumps(get_runtime_info()))
         return 0
 
+    if args.review_list_json:
+        state = load_review_state(output_dir)
+        state["pending_count"] = len(pending_review_items(state))
+        print(json.dumps(state))
+        return 0
+
+    if args.review_action:
+        if not args.review_item_id.strip():
+            print(json.dumps({"ok": False, "error": "--review-item-id is required for --review-action"}))
+            return 1
+        try:
+            updated_item = apply_review_action(
+                output_dir=output_dir,
+                item_id=args.review_item_id.strip(),
+                action=args.review_action.strip(),
+                target_folder=args.review_target_folder.strip(),
+            )
+            learning_updated = False
+            learning_match: Dict[str, Any] = {}
+            if bool(args.learning_enabled):
+                temp_cfg = Config(
+                    input_dir=".",
+                    output_dir=str(output_dir),
+                    learning_enabled=bool(args.learning_enabled),
+                    learning_memory_file=str(args.learning_memory_file or ""),
+                    learning_auto_threshold=float(args.learning_auto_threshold),
+                    learning_suggest_threshold=float(args.learning_suggest_threshold),
+                )
+                memory_path = memory_file_path(temp_cfg)
+                memory = load_memory(memory_path)
+                learning_updated = update_learning_from_review_item(updated_item, memory)
+                if learning_updated:
+                    save_memory(memory_path, memory)
+                    learning_match = {
+                        "memory_file": str(memory_path),
+                        "feedback_events": int(memory.get("stats", {}).get("total_feedback_events", 0)),
+                    }
+            state = load_review_state(output_dir)
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "item": updated_item,
+                        "pending_count": len(pending_review_items(state)),
+                        "learning_updated": learning_updated,
+                        "learning_info": learning_match,
+                    }
+                )
+            )
+            return 0
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+
     input_dir = Path(args.input_dir).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
 
     if not input_dir.is_dir():
         print(f"Input directory not found: {input_dir}")
@@ -1100,6 +1562,12 @@ def main() -> int:
     cfg = Config(
         input_dir=str(input_dir),
         output_dir=str(output_dir),
+        review_mode=args.review_mode,
+        learning_enabled=bool(args.learning_enabled),
+        learning_memory_file=str(args.learning_memory_file or ""),
+        learning_auto_threshold=float(args.learning_auto_threshold),
+        learning_suggest_threshold=float(args.learning_suggest_threshold),
+        stop_flag_file=args.stop_flag_file,
         recursive=not args.no_recursive,
         include_generated_folders=args.include_generated_folders,
         live_trace=args.live_trace,
@@ -1113,7 +1581,10 @@ def main() -> int:
         female_confirmation_frames=max(1, args.female_confirmation_frames),
         female_confirmation_window_sec=args.female_confirmation_window_sec,
         min_female_gender_confidence=args.min_female_gender_confidence,
+        min_female_vote_ratio=float(args.min_female_vote_ratio),
+        min_face_area_ratio=max(0.0, float(args.min_face_area_ratio)),
         min_stable_embeddings=max(1, args.min_stable_embeddings),
+        min_stabilization_gender_votes=max(1, int(args.min_stabilization_gender_votes)),
         max_faces_per_frame=args.max_faces_per_frame,
         detection_confidence=args.detection_confidence,
         same_person_threshold=args.same_person_threshold,
@@ -1126,6 +1597,8 @@ def main() -> int:
         gender_proto_path=args.gender_proto_path,
         gender_model_path=args.gender_model_path,
     )
+    cfg.learning_auto_threshold = max(0.0, min(1.0, cfg.learning_auto_threshold))
+    cfg.learning_suggest_threshold = max(0.0, min(cfg.learning_auto_threshold, cfg.learning_suggest_threshold))
 
     proto_path, model_path = resolve_gender_model_paths(cfg)
     cfg.gender_proto_path = str(proto_path)
@@ -1146,6 +1619,16 @@ def main() -> int:
     print(f"Found {len(videos)} videos")
     print(f"Recursive child-folder scan: {cfg.recursive}")
     print(f"Include generated folders: {cfg.include_generated_folders}")
+    print(f"Review mode: {cfg.review_mode}")
+    print(f"Learning enabled: {cfg.learning_enabled}")
+    if cfg.learning_enabled:
+        print(f"Learning memory file: {memory_file_path(cfg)}")
+        print(
+            f"Learning thresholds: auto={cfg.learning_auto_threshold:.2f}, "
+            f"suggest={cfg.learning_suggest_threshold:.2f}"
+        )
+    if str(cfg.stop_flag_file).strip():
+        print(f"Graceful stop flag file: {cfg.stop_flag_file}")
     print(f"Live trace enabled: {cfg.live_trace}")
     if cfg.live_trace and cfg.max_workers > 1:
         print("[WARN] Live frame preview is disabled when max-workers > 1; using text trace only.")
@@ -1155,14 +1638,26 @@ def main() -> int:
     print(
         "Quality settings: "
         f"confirm_frames={cfg.female_confirmation_frames}, "
+        f"min_female_vote_ratio={cfg.min_female_vote_ratio}, "
+        f"min_face_area_ratio={cfg.min_face_area_ratio}, "
         f"min_stable_embeddings={cfg.min_stable_embeddings}, "
+        f"min_stabilization_gender_votes={cfg.min_stabilization_gender_votes}, "
         f"detection_batch_size={cfg.detection_batch_size}, "
         f"dbscan_eps={cfg.dbscan_eps}, "
         f"cluster_merge_threshold={cfg.cluster_merge_threshold}"
     )
 
     progress_disabled = not sys.stdout.isatty()
+    memory_path = memory_file_path(cfg)
+    memory = load_memory(memory_path) if cfg.learning_enabled else {}
     results: List[Dict[str, Any]] = []
+    stopped_early = False
+    stopped_hits = 0
+    stop_flag_path = Path(cfg.stop_flag_file).expanduser() if str(cfg.stop_flag_file).strip() else None
+
+    def stop_flag_is_set() -> bool:
+        return bool(stop_flag_path and stop_flag_path.exists())
+
     if cfg.max_workers == 1:
         init_worker(cfg)
         female_hits = 0
@@ -1170,8 +1665,13 @@ def main() -> int:
         error_hits = 0
         progress = tqdm(videos, total=len(videos), desc="Processing videos", disable=progress_disabled)
         for video in progress:
+            if stop_flag_is_set():
+                stopped_early = True
+                print("[STOP] Stop flag detected. Finishing with processed results only.", flush=True)
+                break
             try:
                 result = process_video(str(video))
+                apply_memory_assist(result, memory, cfg)
                 results.append(result)
             except Exception as exc:
                 result = {
@@ -1179,12 +1679,27 @@ def main() -> int:
                     "female_found": False,
                     "embedding": None,
                     "error": f"Worker failure: {exc}",
+                    "stopped": False,
                     "samples_used": 0,
                     "device": ACTIVE_ACCELERATION,
+                    "decision_label": "error",
+                    "decision_reason": f"Worker failure: {exc}",
+                    "confidence_score": 0.0,
+                    "suggested_cluster_id": None,
+                    "suggested_folder_name": "",
+                    "memory_match_label": "",
+                    "memory_match_score": 0.0,
+                    "memory_applied": False,
+                    "memory_suggestion": "",
                 }
                 results.append(result)
 
-            if result.get("error"):
+            if result.get("stopped"):
+                stopped_hits += 1
+                stopped_early = True
+                print("[STOP] Current video stopped. Finalizing already processed videos.", flush=True)
+                break
+            elif result.get("error"):
                 error_hits += 1
             elif result.get("female_found"):
                 female_hits += 1
@@ -1203,7 +1718,9 @@ def main() -> int:
                     }
                 )
     else:
-        with ProcessPoolExecutor(max_workers=cfg.max_workers, initializer=init_worker, initargs=(cfg,)) as executor:
+        executor = ProcessPoolExecutor(max_workers=cfg.max_workers, initializer=init_worker, initargs=(cfg,))
+        futures: Dict[Any, Path] = {}
+        try:
             futures = {executor.submit(process_video, str(video)): video for video in videos}
             female_hits = 0
             no_female_hits = 0
@@ -1218,6 +1735,7 @@ def main() -> int:
                 video = futures[future]
                 try:
                     result = future.result()
+                    apply_memory_assist(result, memory, cfg)
                     results.append(result)
                 except Exception as exc:
                     result = {
@@ -1227,10 +1745,23 @@ def main() -> int:
                         "error": f"Worker failure: {exc}",
                         "samples_used": 0,
                         "device": "unknown",
+                        "decision_label": "error",
+                        "decision_reason": f"Worker failure: {exc}",
+                        "confidence_score": 0.0,
+                        "stopped": False,
+                        "suggested_cluster_id": None,
+                        "suggested_folder_name": "",
+                        "memory_match_label": "",
+                        "memory_match_score": 0.0,
+                        "memory_applied": False,
+                        "memory_suggestion": "",
                     }
                     results.append(result)
 
-                if result.get("error"):
+                if result.get("stopped"):
+                    stopped_hits += 1
+                    stopped_early = True
+                elif result.get("error"):
                     error_hits += 1
                 elif result.get("female_found"):
                     female_hits += 1
@@ -1248,47 +1779,155 @@ def main() -> int:
                             "errors": error_hits,
                         }
                     )
+                if stop_flag_is_set():
+                    stopped_early = True
+                    print("[STOP] Stop flag detected. Cancelling pending workers and finalizing processed results.", flush=True)
+                    break
+        finally:
+            if stopped_early:
+                for future in futures:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
 
     for item in results:
         if item.get("error"):
             print(f"[WARN] {item['video']}: {item['error']}")
 
-    successful_results = [item for item in results if not item.get("error")]
+    successful_results = [item for item in results if not item.get("error") and not item.get("stopped")]
     failed_results = [item for item in results if item.get("error")]
+    stopped_results = [item for item in results if item.get("stopped")]
     if not successful_results:
+        if stopped_early or stopped_results:
+            print("\n[STOP] No completed videos to move yet. Stopped cleanly.")
+            close_live_preview()
+            return 0
         print("\n[ERROR] No videos were processed successfully, so nothing will be moved.")
         close_live_preview()
         return 1
 
     cluster_map = cluster_embeddings(results, cfg.dbscan_eps, cfg.dbscan_min_samples)
+    cluster_folder_names = build_cluster_folder_names(cluster_map)
+    if cluster_folder_names:
+        print("\n[CLUSTERS]")
+        for cluster_id in sorted(cluster_folder_names.keys()):
+            print(f"  cluster {cluster_id} -> {cluster_folder_names[cluster_id]}")
+
+    for item in successful_results:
+        if bool(item.get("memory_applied")) and str(item.get("memory_match_label", "")).strip():
+            item["suggested_folder_name"] = sanitize_folder_name(str(item.get("memory_match_label", "")).strip())
+            item["suggested_cluster_id"] = None
+            continue
+        cluster_id = cluster_map.get(str(item.get("video", "")))
+        if cluster_id is None:
+            if item.get("decision_label") == "uncertain":
+                item["suggested_folder_name"] = "Needs_Review"
+            continue
+        cluster_id_int = int(cluster_id)
+        item["suggested_cluster_id"] = cluster_id_int
+        item["suggested_folder_name"] = cluster_folder_names.get(cluster_id_int, f"Female_{cluster_id_int}")
 
     female_count = 0
+    uncertain_count = 0
+    no_female_count = 0
     moved_count = 0
+    queued_count = 0
+    memory_applied_count = 0
+    queue_items: List[Dict[str, Any]] = []
     no_female_dir = output_dir / "No_Female_Found"
 
     for item in tqdm(results, desc="Sorting videos", disable=progress_disabled):
-        if item.get("error"):
+        if item.get("error") or item.get("stopped"):
             continue
         src = Path(item["video"])
         if not src.exists():
             continue
 
-        if item.get("female_found") and str(src) in cluster_map:
+        decision_label = str(item.get("decision_label", "")).strip().lower()
+        route = decide_review_route(item, cfg.review_mode)
+
+        if route == "queue":
+            suggested_folder = str(item.get("suggested_folder_name", "")).strip()
+            if not suggested_folder:
+                suggested_folder = "Needs_Review" if decision_label == "uncertain" else "Female_Unknown"
+            suggested_folder = sanitize_folder_name(suggested_folder)
+            pending_dir = output_dir / REVIEW_PENDING_DIRNAME / suggested_folder
+            pending_path = move_video(src, pending_dir)
+            moved_count += 1
+            queued_count += 1
+            if decision_label == "female_detected":
+                female_count += 1
+            elif decision_label == "uncertain":
+                uncertain_count += 1
+            if bool(item.get("memory_applied")):
+                memory_applied_count += 1
+
+            queue_items.append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "source_path": str(item.get("video", "")),
+                    "pending_path": str(pending_path),
+                    "predicted_label": decision_label or "unknown",
+                    "reason": str(item.get("decision_reason", "")),
+                    "confidence": float(item.get("confidence_score", 0.0)),
+                    "suggested_folder": suggested_folder,
+                    "embedding": item.get("embedding"),
+                    "memory_suggestion": str(item.get("memory_suggestion", "")),
+                    "memory_match_label": str(item.get("memory_match_label", "")),
+                    "memory_match_score": float(item.get("memory_match_score", 0.0)),
+                    "memory_applied": bool(item.get("memory_applied", False)),
+                    "status": "pending",
+                    "final_path": "",
+                    "reviewed_at": "",
+                }
+            )
+            continue
+
+        preferred_folder = str(item.get("suggested_folder_name", "")).strip()
+        if item.get("female_found") and preferred_folder:
             female_count += 1
-            dst_dir = output_dir / f"Female_{cluster_map[str(src)]}"
+            dst_dir = output_dir / sanitize_folder_name(preferred_folder)
+            if bool(item.get("memory_applied")):
+                memory_applied_count += 1
+        elif item.get("female_found") and str(src) in cluster_map:
+            female_count += 1
+            cluster_id = int(cluster_map[str(src)])
+            dst_name = cluster_folder_names.get(cluster_id, f"Female_{cluster_id}")
+            dst_dir = output_dir / sanitize_folder_name(dst_name)
         else:
+            if decision_label == "uncertain":
+                uncertain_count += 1
+            else:
+                no_female_count += 1
             dst_dir = no_female_dir
 
         move_video(src, dst_dir)
         moved_count += 1
 
+    if cfg.review_mode:
+        run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+        state = create_review_state(output_dir, queue_items, run_id)
+        save_review_state(output_dir, state)
+        print(
+            f"\n[REVIEW_QUEUE] run_id={run_id} queued={len(queue_items)} "
+            f"state={review_state_path(output_dir)}",
+            flush=True,
+        )
+
     print("\n===== Summary =====")
     print(f"Total videos: {len(videos)}")
     print(f"Processed successfully: {len(successful_results)}")
     print(f"Processing errors: {len(failed_results)}")
+    print(f"Stopped during processing: {len(stopped_results)}")
+    print(f"Stopped early flag: {stopped_early}")
     print(f"Female detected: {female_count}")
-    print(f"No female found: {len(successful_results) - female_count}")
+    print(f"Uncertain: {uncertain_count}")
+    print(f"No female found: {no_female_count}")
+    print(f"Queued for review: {queued_count}")
+    print(f"Memory auto-applied: {memory_applied_count}")
     print(f"Moved videos: {moved_count}")
+    print(f"Videos left in source: {max(0, len(videos) - moved_count)}")
     print(f"Output directory: {output_dir}")
     print("===================")
     close_live_preview()
