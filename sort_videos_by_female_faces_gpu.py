@@ -16,7 +16,7 @@ This script:
 3. Samples one frame every 2 seconds until it finds the first female face.
 4. Uses InsightFace (RetinaFace + ArcFace) when enabled.
 5. Falls back to legacy MTCNN + InceptionResnetV1 (FaceNet) if needed.
-6. Uses a lightweight OpenCV DNN gender classifier on CPU.
+6. Uses InsightFace gender attributes from detected faces.
 7. Tracks the first detected female for 5-10 seconds and keeps only
    embeddings that match the same identity by cosine similarity.
 8. Clusters video identities with DBSCAN.
@@ -37,12 +37,13 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import queue as queue_module
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
-import urllib.request
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -94,6 +95,7 @@ from learning_memory import (
     load_memory,
     match_identity,
     record_feedback,
+    set_identity_same_person_threshold,
     save_memory,
 )
 from review_queue import (
@@ -108,22 +110,111 @@ from review_queue import (
     save_review_state,
 )
 
+# ---------------------------------------------------------------------------
+# Phase-2 extracted modules – canonical implementations live here now.
+# The main module re-exports symbols for backward compatibility with tests.
+# ---------------------------------------------------------------------------
+from shared.constants import (
+    GENDER_LABELS as GENDER_LABELS,
+    GENDER_MEAN as GENDER_MEAN,
+    GENDER_MODEL_URLS as GENDER_MODEL_URLS,
+    GENDER_PROTO_URL as GENDER_PROTO_URL,
+    LEARNING_DIRNAME as LEARNING_DIRNAME,
+    LEARNING_MEMORY_FACENET_FILENAME as LEARNING_MEMORY_FACENET_FILENAME,
+    LEARNING_MEMORY_INSIGHTFACE_FILENAME as LEARNING_MEMORY_INSIGHTFACE_FILENAME,
+    PROFILE_BALANCED as PROFILE_BALANCED,
+    PROFILE_FAST as PROFILE_FAST,
+    PROFILE_HIGH_ACCURACY as PROFILE_HIGH_ACCURACY,
+    PROFILE_KEY_TO_FLAG as PROFILE_KEY_TO_FLAG,
+    REASON_TAG_PRIORITY as REASON_TAG_PRIORITY,
+    REPORTS_DIRNAME as REPORTS_DIRNAME,
+    RESULT_JSON_PREFIX as RESULT_JSON_PREFIX,
+    RETRY_CHECKPOINT_RATIOS as RETRY_CHECKPOINT_RATIOS,
+    SORTING_EMBEDDING_CACHE_FACENET_FILENAME as SORTING_EMBEDDING_CACHE_FACENET_FILENAME,
+    SORTING_EMBEDDING_CACHE_INSIGHTFACE_FILENAME as SORTING_EMBEDDING_CACHE_INSIGHTFACE_FILENAME,
+    SORTING_EMBEDDING_CACHE_MAX_ITEMS as SORTING_EMBEDDING_CACHE_MAX_ITEMS,
+    SORTING_EMBEDDING_CACHE_SCHEMA_VERSION as SORTING_EMBEDDING_CACHE_SCHEMA_VERSION,
+    UNCERTAIN_DIRNAME as UNCERTAIN_DIRNAME,
+)
+from shared.utils import (
+    atomic_write_text as _atomic_write_text,
+    clamp_confidence,
+    configure_console_encoding,
+    ensure_dir,
+    move_video_collision_safe,
+    safe_console_print,
+    safe_float as _safe_float,
+    safe_int as _safe_int,
+)
+from shared.embedding_ops import (
+    cosine_similarity,
+    normalize_embedding as _normalize_embedding_vector,
+    robust_average_embeddings,
+    safe_embedding_vector as _safe_embedding_vector,
+)
+from clustering import cluster_embeddings
+from embedding_cache import (
+    SortedEmbeddingCacheEntry,
+    embedding_model_key,
+    load_sorting_embedding_cache,
+    normalize_cache_key as _normalize_cache_key,
+    persist_sorted_embedding_cache,
+    sorting_embedding_cache_filename,
+    sorting_embedding_cache_path,
+)
+from explainability import (
+    apply_explainability_metadata,
+    build_result_json_payload,
+    emit_progress,
+    emit_result_json,
+    empty_reason_metrics,
+    new_result_record,
+    set_decision,
+    _normalize_reason_metrics,
+)
+from memory_assist import apply_memory_assist, update_learning_from_review_item
+from reid_engine_torchreid import (
+    active_backend_label as reid_backend_label,
+    extract_reid_embedding as extract_reid_embedding_vector,
+    initialize_reid as initialize_reid_engine,
+    reid_similarity as reid_compare_similarity,
+)
+from reid_fusion import rerank_similarity
+from reporting import (
+    build_per_video_report_rows,
+    build_run_summary_payload,
+    derive_decision_counts,
+    emit_run_reports,
+    report_output_dir,
+    write_run_reports,
+)
+
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
-GENDER_LABELS = ["Male", "Female"]
-GENDER_PROTO_URL = (
-    "https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/gender_deploy.prototxt"
-)
-GENDER_MODEL_URLS = [
-    "https://raw.githubusercontent.com/smahesh29/Gender-and-Age-Detection/master/gender_net.caffemodel",
-    "https://github.com/smahesh29/Gender-and-Age-Detection/raw/master/gender_net.caffemodel",
-]
-GENDER_MEAN = (78.4263377603, 87.7689143744, 114.895847746)
 
 LOGGER = logging.getLogger(__name__)
 
 # Feature flag requested by integration plan; keeps old FaceNet path available.
 USE_INSIGHTFACE = True
+GENDER_ENSEMBLE_SAMPLE_FRAMES = 8
+MIN_GENDER_FACE_SIZE_PX = 80
+MIN_PRIMARY_SUBJECT_REDETECT_RATE = 0.35
+MIN_PRIMARY_SUBJECT_FRAMES = 3
+MIN_PRIMARY_SUBJECT_CONSISTENCY_SCORE = 0.50
+PRIMARY_SUBJECT_SIZE_RATIO_FLOOR = 0.02
+PRIMARY_SUBJECT_SIZE_RATIO_CEIL = 0.12
+DEFAULT_FQA_MIN_LAPLACIAN_VARIANCE = 60.0
+DEFAULT_FQA_MAX_ABS_YAW = 45.0
+DEFAULT_FQA_MAX_ABS_PITCH = 45.0
+DEFAULT_FQA_MIN_LANDMARK_CONFIDENCE = 0.45
+ADAPTIVE_SAME_PERSON_MIN_THRESHOLD = 0.35
+ADAPTIVE_SAME_PERSON_MAX_THRESHOLD = 0.98
+DEFAULT_SCENE_CHANGE_THRESHOLD = 30.0
+DEFAULT_SCENE_CHANGE_SCAN_STEP_SEC = 1.0
+DEFAULT_SCENE_DENSE_WINDOW_SEC = 1.0
+DEFAULT_SCENE_DENSE_STEP_SEC = 0.5
+DEFAULT_SCENE_STATIC_STD_THRESHOLD = 8.0
+DEFAULT_SCENE_STATIC_LAPLACIAN_THRESHOLD = 20.0
 
 
 @dataclass
@@ -146,6 +237,13 @@ class Config:
     use_insightface: bool = USE_INSIGHTFACE
     max_seconds: int = 60
     sample_every_sec: float = 2.0
+    scene_change_aware_sampling: bool = True
+    scene_change_threshold: float = DEFAULT_SCENE_CHANGE_THRESHOLD
+    scene_change_scan_step_sec: float = DEFAULT_SCENE_CHANGE_SCAN_STEP_SEC
+    scene_dense_window_sec: float = DEFAULT_SCENE_DENSE_WINDOW_SEC
+    scene_dense_step_sec: float = DEFAULT_SCENE_DENSE_STEP_SEC
+    scene_static_std_threshold: float = DEFAULT_SCENE_STATIC_STD_THRESHOLD
+    scene_static_laplacian_threshold: float = DEFAULT_SCENE_STATIC_LAPLACIAN_THRESHOLD
     resize_width: int = 960
     detection_batch_size: int = 4
     stabilization_seconds: float = 8.0
@@ -166,7 +264,24 @@ class Config:
     dbscan_eps: float = 0.35
     dbscan_min_samples: int = 1
     cluster_merge_threshold: float = 0.78
+    cross_video_reid: bool = False
+    reid_model_tier: str = "balanced"
+    reid_min_similarity: float = 0.55
+    reid_fusion_weight: float = 0.35
+    reid_ambiguity_margin_low: float = 0.08
+    reid_ambiguity_margin_high: float = 0.06
+    video_io_prefetch: bool = False
     max_workers: int = max(1, min(2, (os.cpu_count() or 4) // 2))
+    subject_min_appearance_rate: float = MIN_PRIMARY_SUBJECT_REDETECT_RATE
+    subject_min_frames: int = MIN_PRIMARY_SUBJECT_FRAMES
+    subject_min_consistency_score: float = MIN_PRIMARY_SUBJECT_CONSISTENCY_SCORE
+    subject_size_ratio_floor: float = PRIMARY_SUBJECT_SIZE_RATIO_FLOOR
+    subject_size_ratio_ceil: float = PRIMARY_SUBJECT_SIZE_RATIO_CEIL
+    fqa_min_laplacian_variance: float = DEFAULT_FQA_MIN_LAPLACIAN_VARIANCE
+    fqa_max_abs_yaw: float = DEFAULT_FQA_MAX_ABS_YAW
+    fqa_max_abs_pitch: float = DEFAULT_FQA_MAX_ABS_PITCH
+    fqa_min_landmark_confidence: float = DEFAULT_FQA_MIN_LANDMARK_CONFIDENCE
+    fqa_min_face_size_px: int = MIN_GENDER_FACE_SIZE_PX
     gender_model_dir: str = ""
     gender_proto_path: str = ""
     gender_model_path: str = ""
@@ -176,50 +291,15 @@ CFG: Optional[Config] = None
 DEVICE: Optional[torch.device] = None
 MTCNN_MODEL: Optional[MTCNN] = None
 EMBED_MODEL: Optional[InceptionResnetV1] = None
-GENDER_NET: Optional[cv2.dnn_Net] = None
 ACTIVE_ACCELERATION = "CPU fallback"
 INSIGHTFACE_ACTIVE = False
 INSIGHTFACE_BACKEND_LABEL = ""
+REID_BACKEND_LABEL = "disabled"
+REID_ENABLED = False
 PREVIEW_ENABLED = False
 PREVIEW_WARNED = False
-PREVIEW_WINDOW_TITLE = "Live Frame Preview"
-RESULT_JSON_PREFIX = "[RESULT_JSON] "
-REPORTS_DIRNAME = ".reports"
-UNCERTAIN_DIRNAME = "Uncertain"
-LEARNING_DIRNAME = ".learning"
 SORTING_EMBEDDING_CACHE_FILENAME = "video_embedding_cache.json"
-SORTING_EMBEDDING_CACHE_INSIGHTFACE_FILENAME = "video_embedding_cache_insightface.json"
-SORTING_EMBEDDING_CACHE_FACENET_FILENAME = "video_embedding_cache_facenet.json"
-SORTING_EMBEDDING_CACHE_SCHEMA_VERSION = 1
-SORTING_EMBEDDING_CACHE_MAX_ITEMS = 50000
-LEARNING_MEMORY_INSIGHTFACE_FILENAME = "memory_insightface_v1.json"
-LEARNING_MEMORY_FACENET_FILENAME = "memory_facenet_v1.json"
-RETRY_CHECKPOINT_RATIOS: Tuple[float, ...] = tuple(step / 100.0 for step in range(5, 100, 5))
-REASON_TAG_PRIORITY = [
-    "memory_match_applied",
-    "gender_disagreement",
-    "few_stable_embeddings",
-    "few_votes",
-    "low_face_area",
-    "unverified_female_candidates",
-    "memory_match_suggested",
-]
-PROFILE_FAST = "fast"
-PROFILE_BALANCED = "balanced"
-PROFILE_HIGH_ACCURACY = "high_accuracy"
-PROFILE_KEY_TO_FLAG = {
-    "max_seconds": "--max-seconds",
-    "sample_every_sec": "--sample-every-sec",
-    "stabilization_seconds": "--stabilization-seconds",
-    "resize_width": "--resize-width",
-    "detection_batch_size": "--detection-batch-size",
-    "female_confirmation_frames": "--female-confirmation-frames",
-    "min_female_vote_ratio": "--min-female-vote-ratio",
-    "min_stable_embeddings": "--min-stable-embeddings",
-    "min_stabilization_gender_votes": "--min-stabilization-gender-votes",
-    "same_person_threshold": "--same-person-threshold",
-    "cluster_merge_threshold": "--cluster-merge-threshold",
-}
+
 PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
     PROFILE_FAST: {
         "max_seconds": 40,
@@ -288,6 +368,7 @@ class SortedEmbeddingCacheEntry(TypedDict):
     decision_label: str
     confidence_score: float
     embedding: List[float]
+    reid_embedding: List[float]
     updated_at: str
 
 
@@ -490,51 +571,6 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def download_file(url: str, dst: Path) -> None:
-    ensure_dir(dst.parent)
-    if dst.exists() and dst.stat().st_size > 0:
-        return
-    print(f"Downloading model asset: {dst.name}")
-    tmp_dst = dst.with_suffix(dst.suffix + ".part")
-    if tmp_dst.exists():
-        tmp_dst.unlink()
-    try:
-        urllib.request.urlretrieve(url, tmp_dst)
-        tmp_dst.replace(dst)
-    except Exception:
-        if tmp_dst.exists():
-            tmp_dst.unlink()
-        raise
-
-
-def download_first_available(urls: Sequence[str], dst: Path) -> None:
-    if dst.exists() and dst.stat().st_size > 0:
-        return
-
-    last_error: Optional[Exception] = None
-    for url in urls:
-        try:
-            download_file(url, dst)
-            return
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f"Failed to download {dst.name} from all known sources. Last error: {last_error}")
-
-
-def resolve_gender_model_paths(cfg: Config) -> Tuple[Path, Path]:
-    base_dir = Path(cfg.gender_model_dir or (Path(cfg.output_dir) / ".model_cache"))
-    proto_path = Path(cfg.gender_proto_path) if cfg.gender_proto_path else base_dir / "gender_deploy.prototxt"
-    model_path = Path(cfg.gender_model_path) if cfg.gender_model_path else base_dir / "gender_net.caffemodel"
-
-    if not proto_path.exists():
-        download_file(GENDER_PROTO_URL, proto_path)
-    if not model_path.exists():
-        download_first_available(GENDER_MODEL_URLS, model_path)
-
-    return proto_path, model_path
-
-
 def _load_legacy_facenet_models(cfg: Config, preferred_device: torch.device) -> str:
     """Legacy FaceNet loader kept for backward-compatible fallback."""
     global DEVICE, MTCNN_MODEL, EMBED_MODEL
@@ -599,12 +635,15 @@ def _disable_insightface_runtime(reason: Exception) -> None:
 
 
 def init_worker(cfg: Config) -> None:
-    global CFG, DEVICE, MTCNN_MODEL, EMBED_MODEL, GENDER_NET, ACTIVE_ACCELERATION
+    global CFG, DEVICE, MTCNN_MODEL, EMBED_MODEL, ACTIVE_ACCELERATION
     global PREVIEW_ENABLED, INSIGHTFACE_ACTIVE, INSIGHTFACE_BACKEND_LABEL
+    global REID_BACKEND_LABEL, REID_ENABLED
     CFG = cfg
     PREVIEW_ENABLED = bool(cfg.live_trace and cfg.max_workers == 1)
     INSIGHTFACE_ACTIVE = False
     INSIGHTFACE_BACKEND_LABEL = ""
+    REID_BACKEND_LABEL = "disabled"
+    REID_ENABLED = bool(cfg.cross_video_reid)
     DEVICE = None
     MTCNN_MODEL = None
     EMBED_MODEL = None
@@ -618,14 +657,23 @@ def init_worker(cfg: Config) -> None:
             flush=True,
         )
 
-    proto_path, model_path = resolve_gender_model_paths(cfg)
-
-    GENDER_NET = cv2.dnn.readNetFromCaffe(str(proto_path), str(model_path))
-    GENDER_NET.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    GENDER_NET.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-
     preferred_device, preferred_reason = choose_preferred_device(force_gpu=cfg.force_gpu)
     print(f"[INFO] Preferred acceleration: {preferred_device.type} | {preferred_reason}", flush=True)
+
+    if REID_ENABLED:
+        try:
+            REID_BACKEND_LABEL = initialize_reid_engine(
+                model_tier=str(cfg.reid_model_tier or "balanced"),
+                device_pref="cuda" if preferred_device.type == "cuda" else "cpu",
+            )
+        except Exception as exc:
+            REID_BACKEND_LABEL = f"disabled ({exc})"
+        print(
+            f"[INFO] Cross-video ReID: enabled tier={cfg.reid_model_tier} backend={REID_BACKEND_LABEL}",
+            flush=True,
+        )
+    else:
+        print("[INFO] Cross-video ReID: disabled", flush=True)
 
     if cfg.use_insightface:
         if not INSIGHTFACE_MODULE_AVAILABLE:
@@ -722,6 +770,178 @@ def get_video_meta(cap: cv2.VideoCapture) -> Tuple[float, int, float]:
     return fps, total_frames, duration_sec
 
 
+@dataclass
+class PrefetchedVideo:
+    video_path: str
+    fps: float
+    total_frames: int
+    duration_sec: float
+    frame_map: Dict[int, np.ndarray]
+    prefetch_stride_sec: float
+
+
+@dataclass
+class PrefetchQueueItem:
+    video_path: str
+    payload: Optional[PrefetchedVideo]
+    error: str = ""
+
+
+class PrefetchedCapture:
+    """Proxy around cv2.VideoCapture that serves prefetched frames first."""
+
+    def __init__(self, inner: cv2.VideoCapture, payload: Optional[PrefetchedVideo]) -> None:
+        self._inner = inner
+        self._payload = payload
+        self._cursor = 0
+
+    def isOpened(self) -> bool:
+        return self._inner.isOpened()
+
+    def set(self, prop_id: int, value: float) -> bool:
+        if prop_id == cv2.CAP_PROP_POS_FRAMES:
+            self._cursor = max(0, int(value))
+        return self._inner.set(prop_id, value)
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        if self._payload is not None:
+            frame = self._payload.frame_map.get(self._cursor)
+            if frame is not None:
+                self._cursor += 1
+                return True, frame.copy()
+        self._inner.set(cv2.CAP_PROP_POS_FRAMES, self._cursor)
+        ok, frame = self._inner.read()
+        if ok:
+            self._cursor += 1
+        return ok, frame if ok else None
+
+    def grab(self) -> bool:
+        if self._payload is not None and self._cursor in self._payload.frame_map:
+            self._cursor += 1
+            return True
+        self._inner.set(cv2.CAP_PROP_POS_FRAMES, self._cursor)
+        ok = self._inner.grab()
+        if ok:
+            self._cursor += 1
+        return bool(ok)
+
+    def get(self, prop_id: int) -> float:
+        if self._payload is not None:
+            if prop_id == cv2.CAP_PROP_FPS:
+                return float(self._payload.fps)
+            if prop_id == cv2.CAP_PROP_FRAME_COUNT:
+                return float(self._payload.total_frames)
+        return float(self._inner.get(prop_id))
+
+    def release(self) -> None:
+        self._inner.release()
+
+
+def _prefetch_stride_seconds(cfg: Config) -> float:
+    candidates = [float(cfg.sample_every_sec), float(cfg.stabilization_sample_sec)]
+    if bool(cfg.scene_change_aware_sampling):
+        candidates.append(float(cfg.scene_change_scan_step_sec))
+        candidates.append(float(cfg.scene_dense_step_sec))
+    positive = [value for value in candidates if value > 0.0]
+    if not positive:
+        return 1.0
+    return max(0.25, min(positive))
+
+
+def _prefetch_frame_indices(
+    *,
+    fps: float,
+    total_frames: int,
+    scan_duration: float,
+    cfg: Config,
+) -> List[int]:
+    stride = _prefetch_stride_seconds(cfg)
+    sample_times = build_sample_times(scan_duration, stride)
+    sample_times.extend([0.0, scan_duration])
+    indices = {
+        timestamp_to_frame_index(timestamp_sec, fps, total_frames)
+        for timestamp_sec in sample_times
+    }
+    return sorted(idx for idx in indices if 0 <= idx < total_frames)
+
+
+def prefetch_video_frames(video_path: Path, cfg: Config) -> PrefetchedVideo:
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            return PrefetchedVideo(
+                video_path=str(video_path.resolve()),
+                fps=25.0,
+                total_frames=0,
+                duration_sec=0.0,
+                frame_map={},
+                prefetch_stride_sec=_prefetch_stride_seconds(cfg),
+            )
+        fps, total_frames, duration_sec = get_video_meta(cap)
+        if total_frames <= 0:
+            return PrefetchedVideo(
+                video_path=str(video_path.resolve()),
+                fps=float(fps),
+                total_frames=0,
+                duration_sec=float(duration_sec),
+                frame_map={},
+                prefetch_stride_sec=_prefetch_stride_seconds(cfg),
+            )
+
+        scan_duration = min(float(cfg.max_seconds), duration_sec if duration_sec > 0 else float(cfg.max_seconds))
+        frame_indices = _prefetch_frame_indices(
+            fps=fps,
+            total_frames=total_frames,
+            scan_duration=scan_duration,
+            cfg=cfg,
+        )
+        raw_map = read_frames_at_indices(cap, frame_indices)
+        frame_map: Dict[int, np.ndarray] = {}
+        for idx, frame in raw_map.items():
+            if frame is None:
+                continue
+            frame_map[int(idx)] = frame
+        return PrefetchedVideo(
+            video_path=str(video_path.resolve()),
+            fps=float(fps),
+            total_frames=int(total_frames),
+            duration_sec=float(duration_sec),
+            frame_map=frame_map,
+            prefetch_stride_sec=_prefetch_stride_seconds(cfg),
+        )
+    finally:
+        cap.release()
+
+
+def prefetch_video_producer(
+    video_paths: Sequence[Path],
+    cfg: Config,
+    out_queue: "queue_module.Queue[PrefetchQueueItem]",
+    stop_event: threading.Event,
+) -> None:
+    def _safe_put(item: PrefetchQueueItem) -> bool:
+        while not stop_event.is_set():
+            try:
+                out_queue.put(item, timeout=0.2)
+                return True
+            except queue_module.Full:
+                continue
+        return False
+
+    for path in video_paths:
+        if stop_event.is_set():
+            break
+        payload: Optional[PrefetchedVideo] = None
+        error_text = ""
+        try:
+            payload = prefetch_video_frames(path, cfg)
+        except Exception as exc:
+            error_text = str(exc)
+        if not _safe_put(PrefetchQueueItem(video_path=str(path.resolve()), payload=payload, error=error_text)):
+            return
+    _safe_put(PrefetchQueueItem(video_path="__PREFETCH_DONE__", payload=None, error=""))
+
+
 def clamp_box(box: Sequence[float], width: int, height: int) -> Optional[Tuple[int, int, int, int]]:
     x1, y1, x2, y2 = box
     x1 = max(0, min(width - 1, int(round(x1))))
@@ -791,6 +1011,11 @@ def _format_detections_for_frame(
                 "prob": float(prob),
                 "area": float((x2 - x1) * (y2 - y1)),
                 "embedding": None,
+                "gender": None,
+                "age": None,
+                "pose_yaw": None,
+                "pose_pitch": None,
+                "landmark_confidence": float(prob),
             }
         )
 
@@ -834,21 +1059,32 @@ def detect_faces_batch(frames_rgb: Sequence[np.ndarray]) -> List[List[Dict[str, 
     ]
 
 
-def classify_gender(face_bgr: np.ndarray) -> Tuple[str, float]:
-    assert GENDER_NET is not None
+def classify_gender(face_bgr: Optional[np.ndarray] = None, face: Optional[Dict[str, Any]] = None) -> Tuple[str, float]:
+    del face_bgr  # Kept for backward-compatible call signature.
 
-    blob = cv2.dnn.blobFromImage(
-        image=cv2.resize(face_bgr, (227, 227)),
-        scalefactor=1.0,
-        size=(227, 227),
-        mean=GENDER_MEAN,
-        swapRB=False,
-        crop=False,
-    )
-    GENDER_NET.setInput(blob)
-    probs = GENDER_NET.forward()[0]
-    best_idx = int(np.argmax(probs))
-    return GENDER_LABELS[best_idx], float(probs[best_idx])
+    if not isinstance(face, dict):
+        return "Unknown", 0.0
+
+    gender_raw = face.get("gender")
+    if gender_raw is None:
+        return "Unknown", 0.0
+
+    try:
+        if isinstance(gender_raw, np.ndarray):
+            if gender_raw.size == 0:
+                return "Unknown", 0.0
+            gender_val = float(gender_raw.reshape(-1)[0])
+        else:
+            gender_val = float(gender_raw)
+    except Exception:
+        return "Unknown", 0.0
+
+    gender_idx = int(round(gender_val))
+    if gender_idx == 0:
+        return "Female", 1.0
+    if gender_idx == 1:
+        return "Male", 1.0
+    return "Unknown", 0.0
 
 
 def prepare_face_tensor(face_rgb: np.ndarray) -> torch.Tensor:
@@ -948,12 +1184,365 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def build_sample_times(max_seconds: float, step_seconds: float) -> List[float]:
-    times: List[float] = []
-    t = 0.0
-    while t <= max_seconds:
-        times.append(t)
-        t += step_seconds
-    return times
+    if step_seconds <= 0:
+        return [0.0] if max_seconds >= 0 else []
+    # Use np.arange to avoid float-accumulation drift from repeated addition.
+    return [float(t) for t in np.arange(0.0, max_seconds + step_seconds * 0.5, step_seconds)]
+
+
+def build_uniform_sample_times(start_sec: float, end_sec: float, sample_count: int) -> List[float]:
+    start = max(0.0, float(start_sec))
+    end = max(start, float(end_sec))
+    count = max(1, int(sample_count))
+    if count == 1 or end <= start:
+        return [start]
+    return [float(value) for value in np.linspace(start, end, num=count)]
+
+
+def _frame_scene_features(frame_bgr: np.ndarray) -> Tuple[np.ndarray, float, float]:
+    resized = cv2.resize(frame_bgr, (96, 54), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+    hist = cv2.calcHist([gray], [0], None, [32], [0, 256]).astype(np.float32)
+    hist /= float(hist.sum() + 1e-8)
+    std_val = float(np.std(gray))
+    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return hist.reshape(-1), std_val, lap_var
+
+
+def detect_scene_changes(
+    cap: cv2.VideoCapture,
+    *,
+    fps: float,
+    total_frames: int,
+    start_sec: float,
+    end_sec: float,
+    threshold: float = DEFAULT_SCENE_CHANGE_THRESHOLD,
+    scan_step_sec: float = DEFAULT_SCENE_CHANGE_SCAN_STEP_SEC,
+    static_std_threshold: float = DEFAULT_SCENE_STATIC_STD_THRESHOLD,
+    static_laplacian_threshold: float = DEFAULT_SCENE_STATIC_LAPLACIAN_THRESHOLD,
+) -> Tuple[List[float], List[float]]:
+    """Detect coarse scene-change and static/title timestamps."""
+    if end_sec <= start_sec:
+        return [], []
+
+    step_sec = max(0.1, float(scan_step_sec))
+    sample_offsets = build_sample_times(max(0.0, float(end_sec - start_sec)), step_sec)
+    sample_times = [float(start_sec) + float(offset) for offset in sample_offsets]
+    sample_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
+    frame_map = read_frames_at_indices(cap, sample_indices)
+
+    scene_changes: List[float] = []
+    static_times: List[float] = []
+    prev_hist: Optional[np.ndarray] = None
+    prev_static = False
+
+    for timestamp_sec, frame_index in zip(sample_times, sample_indices):
+        frame = frame_map.get(frame_index)
+        if frame is None:
+            continue
+
+        hist, std_val, lap_var = _frame_scene_features(frame)
+        is_static = std_val <= float(static_std_threshold) and lap_var <= float(static_laplacian_threshold)
+        if is_static:
+            static_times.append(float(timestamp_sec))
+
+        if prev_hist is not None:
+            diff_score = float(cv2.compareHist(prev_hist, hist, cv2.HISTCMP_BHATTACHARYYA) * 100.0)
+            if diff_score >= float(threshold) and not is_static and not prev_static:
+                scene_changes.append(float(timestamp_sec))
+
+        prev_hist = hist
+        prev_static = is_static
+
+    return scene_changes, static_times
+
+
+def build_scene_aware_sample_times(
+    *,
+    cap: cv2.VideoCapture,
+    fps: float,
+    total_frames: int,
+    scan_start_sec: float,
+    scan_end_sec: float,
+    cfg: Config,
+) -> Tuple[List[float], Dict[str, Any]]:
+    base_times = [
+        scan_start_sec + offset
+        for offset in build_sample_times(max(0.0, scan_end_sec - scan_start_sec), cfg.sample_every_sec)
+    ]
+    info = {
+        "scene_changes_detected": 0,
+        "scene_dense_samples_added": 0,
+        "scene_static_samples_skipped": 0,
+    }
+    if not bool(cfg.scene_change_aware_sampling):
+        return base_times, info
+
+    scene_changes, static_times = detect_scene_changes(
+        cap,
+        fps=fps,
+        total_frames=total_frames,
+        start_sec=scan_start_sec,
+        end_sec=scan_end_sec,
+        threshold=cfg.scene_change_threshold,
+        scan_step_sec=cfg.scene_change_scan_step_sec,
+        static_std_threshold=cfg.scene_static_std_threshold,
+        static_laplacian_threshold=cfg.scene_static_laplacian_threshold,
+    )
+    info["scene_changes_detected"] = int(len(scene_changes))
+
+    dense_times: List[float] = []
+    dense_step = max(0.1, float(cfg.scene_dense_step_sec))
+    for ts in scene_changes:
+        dense_start = max(scan_start_sec, float(ts) - float(cfg.scene_dense_window_sec))
+        dense_end = min(scan_end_sec, float(ts) + float(cfg.scene_dense_window_sec))
+        offsets = build_sample_times(max(0.0, dense_end - dense_start), dense_step)
+        dense_times.extend(dense_start + off for off in offsets)
+
+    info["scene_dense_samples_added"] = int(len(dense_times))
+
+    merged = sorted(base_times + dense_times)
+    deduped: List[float] = []
+    seen: set[float] = set()
+    for ts in merged:
+        key = round(float(ts), 3)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(float(ts))
+
+    if not static_times:
+        return deduped, info
+
+    skip_tol = max(0.15, min(float(cfg.sample_every_sec), float(cfg.scene_change_scan_step_sec)) * 0.5)
+    filtered: List[float] = []
+    skipped = 0
+    for ts in deduped:
+        if any(abs(ts - st) <= skip_tol for st in static_times):
+            skipped += 1
+            continue
+        filtered.append(ts)
+    info["scene_static_samples_skipped"] = int(skipped)
+
+    if not filtered:
+        # Safety fallback to avoid empty scan schedules.
+        return deduped[:1] if deduped else [scan_start_sec], info
+    return filtered, info
+
+
+def face_box_size(box: Tuple[int, int, int, int]) -> Tuple[int, int]:
+    return max(0, int(box[2] - box[0])), max(0, int(box[3] - box[1]))
+
+
+def is_face_size_valid(box: Tuple[int, int, int, int], min_size_px: int = MIN_GENDER_FACE_SIZE_PX) -> bool:
+    width, height = face_box_size(box)
+    return width >= int(min_size_px) and height >= int(min_size_px)
+
+
+def quality_check(
+    face_bgr: Optional[np.ndarray],
+    face: Optional[Dict[str, Any]],
+    cfg: Config,
+    diagnostics: Optional[Dict[str, int]] = None,
+) -> bool:
+    """Fast face quality gate used before embedding generation."""
+    if face_bgr is None or face_bgr.size == 0:
+        if diagnostics is not None:
+            diagnostics["fqa_invalid_crop"] = int(diagnostics.get("fqa_invalid_crop", 0)) + 1
+        return False
+
+    height, width = face_bgr.shape[:2]
+    if width < int(cfg.fqa_min_face_size_px) or height < int(cfg.fqa_min_face_size_px):
+        if diagnostics is not None:
+            diagnostics["fqa_small_face"] = int(diagnostics.get("fqa_small_face", 0)) + 1
+        return False
+
+    try:
+        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY) if face_bgr.ndim == 3 else face_bgr
+        blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    except Exception:
+        blur_var = 0.0
+    if blur_var < float(cfg.fqa_min_laplacian_variance):
+        if diagnostics is not None:
+            diagnostics["fqa_blur_rejections"] = int(diagnostics.get("fqa_blur_rejections", 0)) + 1
+        return False
+
+    if isinstance(face, dict):
+        yaw_raw = face.get("pose_yaw")
+        pitch_raw = face.get("pose_pitch")
+        try:
+            yaw = abs(float(yaw_raw)) if yaw_raw is not None else None
+        except Exception:
+            yaw = None
+        try:
+            pitch = abs(float(pitch_raw)) if pitch_raw is not None else None
+        except Exception:
+            pitch = None
+
+        if yaw is not None and yaw > float(cfg.fqa_max_abs_yaw):
+            if diagnostics is not None:
+                diagnostics["fqa_pose_rejections"] = int(diagnostics.get("fqa_pose_rejections", 0)) + 1
+            return False
+        if pitch is not None and pitch > float(cfg.fqa_max_abs_pitch):
+            if diagnostics is not None:
+                diagnostics["fqa_pose_rejections"] = int(diagnostics.get("fqa_pose_rejections", 0)) + 1
+            return False
+
+        lm_raw = face.get("landmark_confidence", face.get("prob"))
+        try:
+            lm_conf = float(lm_raw) if lm_raw is not None else None
+        except Exception:
+            lm_conf = None
+        if lm_conf is not None and lm_conf < float(cfg.fqa_min_landmark_confidence):
+            if diagnostics is not None:
+                diagnostics["fqa_landmark_rejections"] = int(diagnostics.get("fqa_landmark_rejections", 0)) + 1
+            return False
+
+    return True
+
+
+def score_subject_temporal_consistency(
+    appearance_frequency: float,
+    average_face_area_ratio: float,
+    temporal_coverage: float,
+    *,
+    size_ratio_floor: float,
+    size_ratio_ceil: float,
+) -> float:
+    """Score whether a tracked face looks like the main subject over time."""
+    freq_score = clamp_confidence(float(appearance_frequency))
+    coverage_score = clamp_confidence(float(temporal_coverage))
+    floor = max(1e-6, float(size_ratio_floor))
+    ceil = max(floor + 1e-6, float(size_ratio_ceil))
+    size_score = clamp_confidence((float(average_face_area_ratio) - floor) / (ceil - floor))
+    return clamp_confidence((0.60 * freq_score) + (0.30 * size_score) + (0.10 * coverage_score))
+
+
+def evaluate_primary_subject_gender(
+    cap: cv2.VideoCapture,
+    fps: float,
+    total_frames: int,
+    scan_duration: float,
+    first_ts: float,
+    first_embedding: np.ndarray,
+    cfg: Config,
+) -> Tuple[str, float, Dict[str, Any]]:
+    """Run multi-frame weighted gender voting for the tracked identity."""
+    start_ts = max(0.0, min(float(first_ts), float(scan_duration)))
+    sample_times = build_uniform_sample_times(start_ts, float(scan_duration), GENDER_ENSEMBLE_SAMPLE_FRAMES)
+    frame_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
+
+    attempted_frames = 0
+    redetected_frames = 0
+    small_face_rejections = 0
+    female_weight = 0.0
+    male_weight = 0.0
+    matched_positions: List[int] = []
+    matched_area_ratio_sum = 0.0
+    matched_area_ratio_count = 0
+    running_reference = np.asarray(first_embedding, dtype=np.float32).copy()
+
+    for start in range(0, len(frame_indices), cfg.detection_batch_size):
+        ensure_not_stopped()
+        chunk_indices = frame_indices[start : start + cfg.detection_batch_size]
+        frame_map = read_frames_at_indices(cap, chunk_indices)
+
+        valid_items: List[Tuple[int, np.ndarray, np.ndarray]] = []
+        for frame_index in chunk_indices:
+            frame_bgr = frame_map.get(frame_index)
+            if frame_bgr is None:
+                continue
+            frame_bgr = resize_frame(frame_bgr, cfg.resize_width)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            valid_items.append((frame_index, frame_bgr, frame_rgb))
+
+        if not valid_items:
+            continue
+
+        detections_batch = detect_faces_batch([item[2] for item in valid_items])
+        for pos, ((_frame_index, frame_bgr, _frame_rgb), faces) in enumerate(zip(valid_items, detections_batch)):
+            attempted_frames += 1
+            if not faces:
+                continue
+
+            diagnostics: Dict[str, int] = {}
+            matched_embedding, matched_box, similarity, matched_face = select_best_matching_face(
+                frame_bgr=frame_bgr,
+                faces=faces,
+                reference_embedding=running_reference,
+                cfg=cfg,
+                diagnostics=diagnostics,
+            )
+            small_face_rejections += int(diagnostics.get("small_face_rejections", 0))
+            if matched_embedding is None or matched_box is None or similarity < cfg.same_person_threshold:
+                continue
+            if not is_face_size_valid(matched_box, min_size_px=cfg.fqa_min_face_size_px):
+                small_face_rejections += 1
+                continue
+
+            redetected_frames += 1
+            matched_positions.append(start + pos)
+            matched_area_ratio_sum += face_area_ratio(matched_box, frame_bgr)
+            matched_area_ratio_count += 1
+
+            gender_label, gender_conf = classify_gender(face=matched_face)
+            if gender_label.lower() not in {"female", "male"} or gender_conf <= 0.0:
+                continue
+
+            area_weight = float(max(1, matched_box[2] - matched_box[0]) * max(1, matched_box[3] - matched_box[1]))
+            weighted_vote = area_weight * float(gender_conf)
+            if gender_label.lower() == "female":
+                female_weight += weighted_vote
+            else:
+                male_weight += weighted_vote
+
+            # Keep tracking robust as pose shifts.
+            running_reference = running_reference + (matched_embedding - running_reference) / float(max(1, redetected_frames))
+            norm_val = float(np.linalg.norm(running_reference))
+            if norm_val > 1e-8:
+                running_reference = (running_reference / norm_val).astype(np.float32)
+
+    vote_total = female_weight + male_weight
+    if vote_total > 0:
+        final_gender = "Female" if female_weight >= male_weight else "Male"
+        vote_confidence = max(female_weight, male_weight) / vote_total
+    else:
+        final_gender = "Unknown"
+        vote_confidence = 0.0
+
+    redetection_rate = (float(redetected_frames) / float(attempted_frames)) if attempted_frames > 0 else 0.0
+    if frame_indices and matched_positions:
+        temporal_coverage = float((max(matched_positions) - min(matched_positions) + 1) / float(len(frame_indices)))
+        temporal_coverage = clamp_confidence(temporal_coverage)
+    else:
+        temporal_coverage = 0.0
+    average_face_area_ratio = (
+        float(matched_area_ratio_sum) / float(matched_area_ratio_count) if matched_area_ratio_count > 0 else 0.0
+    )
+    subject_consistency_score = score_subject_temporal_consistency(
+        appearance_frequency=redetection_rate,
+        average_face_area_ratio=average_face_area_ratio,
+        temporal_coverage=temporal_coverage,
+        size_ratio_floor=cfg.subject_size_ratio_floor,
+        size_ratio_ceil=cfg.subject_size_ratio_ceil,
+    )
+    final_confidence = clamp_confidence((0.55 * vote_confidence) + (0.45 * subject_consistency_score))
+    if redetected_frames < cfg.subject_min_frames:
+        final_confidence *= 0.7
+
+    return final_gender, clamp_confidence(final_confidence), {
+        "attempted_frames": int(attempted_frames),
+        "redetected_frames": int(redetected_frames),
+        "appearance_frequency": round(redetection_rate, 4),
+        "redetection_rate": round(redetection_rate, 4),
+        "temporal_coverage": round(temporal_coverage, 4),
+        "average_face_area_ratio": round(float(average_face_area_ratio), 4),
+        "subject_consistency_score": round(float(subject_consistency_score), 4),
+        "female_weight": round(float(female_weight), 4),
+        "male_weight": round(float(male_weight), 4),
+        "vote_confidence": round(float(vote_confidence), 4),
+        "small_face_rejections": int(small_face_rejections),
+    }
 
 
 def empty_scan_info() -> Dict[str, Any]:
@@ -962,6 +1551,9 @@ def empty_scan_info() -> Dict[str, Any]:
         "best_seed_confidence": 0.0,
         "total_faces_evaluated": 0,
         "low_face_area_rejections": 0,
+        "scene_changes_detected": 0,
+        "scene_dense_samples_added": 0,
+        "scene_static_samples_skipped": 0,
     }
 
 
@@ -978,6 +1570,12 @@ def merge_scan_info(base: Optional[Dict[str, Any]], extra: Optional[Dict[str, An
         + int(extra_info.get("total_faces_evaluated", 0)),
         "low_face_area_rejections": int(base_info.get("low_face_area_rejections", 0))
         + int(extra_info.get("low_face_area_rejections", 0)),
+        "scene_changes_detected": int(base_info.get("scene_changes_detected", 0))
+        + int(extra_info.get("scene_changes_detected", 0)),
+        "scene_dense_samples_added": int(base_info.get("scene_dense_samples_added", 0))
+        + int(extra_info.get("scene_dense_samples_added", 0)),
+        "scene_static_samples_skipped": int(base_info.get("scene_static_samples_skipped", 0))
+        + int(extra_info.get("scene_static_samples_skipped", 0)),
     }
 
 
@@ -1253,7 +1851,7 @@ def verify_female_candidate(
         if not faces:
             continue
 
-        matched_embedding, matched_box, similarity = select_best_matching_face(
+        matched_embedding, matched_box, similarity, matched_face = select_best_matching_face(
             frame_bgr=frame_bgr,
             faces=faces,
             reference_embedding=first_embedding,
@@ -1262,13 +1860,9 @@ def verify_female_candidate(
         if matched_embedding is None or matched_box is None or similarity < cfg.same_person_threshold:
             continue
 
-        face_bgr = crop_bgr(frame_bgr, matched_box)
-        if face_bgr is None:
+        gender_label, gender_conf = classify_gender(face=matched_face)
+        if gender_label.lower() not in {"female", "male"} or gender_conf <= 0.0:
             continue
-        if face_area_ratio(matched_box, frame_bgr) < cfg.min_face_area_ratio:
-            continue
-
-        gender_label, gender_conf = classify_gender(face_bgr)
         votes += 1
         if gender_label.lower() == "female":
             female_score += gender_conf
@@ -1309,7 +1903,14 @@ def find_first_female(
 ) -> FindFirstFemaleResult:
     scan_start_sec = max(0.0, float(scan_start_sec))
     scan_end_sec = max(scan_start_sec, float(scan_duration))
-    sample_times = [scan_start_sec + offset for offset in build_sample_times(scan_end_sec - scan_start_sec, cfg.sample_every_sec)]
+    sample_times, scene_info = build_scene_aware_sample_times(
+        cap=cap,
+        fps=fps,
+        total_frames=total_frames,
+        scan_start_sec=scan_start_sec,
+        scan_end_sec=scan_end_sec,
+        cfg=cfg,
+    )
     sample_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
     female_seed_hits = 0
     best_seed_conf = 0.0
@@ -1351,6 +1952,9 @@ def find_first_female(
                 total_faces_evaluated += 1
 
                 expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
+                if not is_face_size_valid(expanded, min_size_px=cfg.fqa_min_face_size_px):
+                    low_face_area_rejections += 1
+                    continue
                 if face_area_ratio(expanded, frame_bgr) < cfg.min_face_area_ratio:
                     low_face_area_rejections += 1
                     continue
@@ -1358,11 +1962,15 @@ def find_first_female(
                 if face_bgr is None:
                     continue
 
-                gender_label, gender_conf = classify_gender(face_bgr)
+                gender_label, gender_conf = classify_gender(face=face)
                 if gender_label.lower() != "female" or gender_conf < cfg.min_female_gender_confidence:
                     continue
                 female_seed_hits += 1
                 best_seed_conf = max(best_seed_conf, float(gender_conf))
+
+                if not quality_check(face_bgr, face, cfg):
+                    low_face_area_rejections += 1
+                    continue
 
                 embedding, _ = get_face_embedding(face_bgr, precomputed_detection=face)
                 if embedding is None:
@@ -1399,6 +2007,9 @@ def find_first_female(
                         "best_seed_confidence": best_seed_conf,
                         "total_faces_evaluated": total_faces_evaluated,
                         "low_face_area_rejections": low_face_area_rejections,
+                        "scene_changes_detected": int(scene_info.get("scene_changes_detected", 0)),
+                        "scene_dense_samples_added": int(scene_info.get("scene_dense_samples_added", 0)),
+                        "scene_static_samples_skipped": int(scene_info.get("scene_static_samples_skipped", 0)),
                     },
                 )
 
@@ -1413,6 +2024,9 @@ def find_first_female(
             "best_seed_confidence": best_seed_conf,
             "total_faces_evaluated": total_faces_evaluated,
             "low_face_area_rejections": low_face_area_rejections,
+            "scene_changes_detected": int(scene_info.get("scene_changes_detected", 0)),
+            "scene_dense_samples_added": int(scene_info.get("scene_dense_samples_added", 0)),
+            "scene_static_samples_skipped": int(scene_info.get("scene_static_samples_skipped", 0)),
         },
     )
 
@@ -1423,9 +2037,10 @@ def select_best_matching_face(
     reference_embedding: np.ndarray,
     cfg: Config,
     diagnostics: Optional[Dict[str, int]] = None,
-) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]], float]:
+) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]], float, Optional[Dict[str, Any]]]:
     candidate_boxes: List[Tuple[int, int, int, int]] = []
     candidate_embeddings: List[Optional[np.ndarray]] = []
+    candidate_faces: List[Dict[str, Any]] = []
 
     for face in faces[: cfg.max_faces_per_frame]:
         if face["prob"] < cfg.detection_confidence:
@@ -1433,6 +2048,10 @@ def select_best_matching_face(
         if diagnostics is not None:
             diagnostics["total_faces_evaluated"] = int(diagnostics.get("total_faces_evaluated", 0)) + 1
         expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
+        if not is_face_size_valid(expanded, min_size_px=cfg.fqa_min_face_size_px):
+            if diagnostics is not None:
+                diagnostics["small_face_rejections"] = int(diagnostics.get("small_face_rejections", 0)) + 1
+            continue
         if face_area_ratio(expanded, frame_bgr) < cfg.min_face_area_ratio:
             if diagnostics is not None:
                 diagnostics["low_face_area_rejections"] = int(diagnostics.get("low_face_area_rejections", 0)) + 1
@@ -1440,25 +2059,28 @@ def select_best_matching_face(
         crop = crop_bgr(frame_bgr, expanded)
         if crop is None:
             continue
+        if not quality_check(crop, face, cfg, diagnostics=diagnostics):
+            continue
         candidate_boxes.append(expanded)
         embedding, _ = get_face_embedding(crop, precomputed_detection=face)
         candidate_embeddings.append(embedding)
+        candidate_faces.append(face)
 
     if not candidate_embeddings:
-        return None, None, -1.0
+        return None, None, -1.0, None
 
-    scored: List[Tuple[np.ndarray, Tuple[int, int, int, int], float]] = []
-    for emb, box in zip(candidate_embeddings, candidate_boxes):
+    scored: List[Tuple[np.ndarray, Tuple[int, int, int, int], float, Dict[str, Any]]] = []
+    for emb, box, face in zip(candidate_embeddings, candidate_boxes, candidate_faces):
         if emb is None:
             continue
-        scored.append((emb, box, cosine_similarity(reference_embedding, emb)))
+        scored.append((emb, box, cosine_similarity(reference_embedding, emb), face))
 
     if not scored:
-        return None, None, -1.0
+        return None, None, -1.0, None
 
     best_idx = int(np.argmax([item[2] for item in scored]))
-    best_embedding, best_box, best_similarity = scored[best_idx]
-    return best_embedding, best_box, float(best_similarity)
+    best_embedding, best_box, best_similarity, best_face = scored[best_idx]
+    return best_embedding, best_box, float(best_similarity), best_face
 
 
 def stabilize_identity(
@@ -1473,7 +2095,7 @@ def stabilize_identity(
     initial_gender_conf: float,
     cfg: Config,
     video_name: str,
-) -> Tuple[List[np.ndarray], float, float, int, Dict[str, int]]:
+) -> Tuple[List[np.ndarray], float, float, int, Dict[str, int], Optional[np.ndarray]]:
     ensure_not_stopped()
     diagnostics: Dict[str, int] = {
         "total_faces_evaluated": 0,
@@ -1483,7 +2105,7 @@ def stabilize_identity(
     if end_ts <= first_ts:
         female_score = initial_gender_conf if initial_gender_label.lower() == "female" else 0.0
         male_score = initial_gender_conf if initial_gender_label.lower() == "male" else 0.0
-        return [first_embedding], female_score, male_score, 1, diagnostics
+        return [first_embedding], female_score, male_score, 1, diagnostics, None
 
     kept_embeddings: List[np.ndarray] = [first_embedding]
     female_score = initial_gender_conf if initial_gender_label.lower() == "female" else 0.0
@@ -1492,6 +2114,8 @@ def stabilize_identity(
     running_reference = first_embedding.copy()
     last_kept = first_embedding.copy()
     current_box = first_box
+    best_reid_face_bgr: Optional[np.ndarray] = None
+    best_reid_face_quality = -1.0
 
     sample_offsets = build_sample_times(end_ts - first_ts, cfg.stabilization_sample_sec)[1:]
     sample_times = [first_ts + offset_sec for offset_sec in sample_offsets]
@@ -1522,7 +2146,7 @@ def stabilize_identity(
             if not faces:
                 continue
 
-            matched_embedding, matched_box, similarity = select_best_matching_face(
+            matched_embedding, matched_box, similarity, matched_face = select_best_matching_face(
                 frame_bgr=frame_bgr,
                 faces=faces,
                 reference_embedding=running_reference,
@@ -1543,9 +2167,8 @@ def stabilize_identity(
             if cosine_similarity(last_kept, matched_embedding) >= cfg.duplicate_threshold:
                 continue
 
-            face_bgr = crop_bgr(frame_bgr, matched_box)
-            if face_bgr is not None:
-                gender_label, gender_conf = classify_gender(face_bgr)
+            gender_label, gender_conf = classify_gender(face=matched_face)
+            if gender_label.lower() in {"female", "male"} and gender_conf > 0.0:
                 gender_votes += 1
                 if gender_label.lower() == "female":
                     female_score += gender_conf
@@ -1555,10 +2178,52 @@ def stabilize_identity(
             kept_embeddings.append(matched_embedding)
             last_kept = matched_embedding
             current_box = matched_box
-            running_reference = np.mean(np.vstack(kept_embeddings), axis=0).astype(np.float32)
-            running_reference /= np.linalg.norm(running_reference) + 1e-8
+            matched_crop = crop_bgr(frame_bgr, matched_box)
+            if matched_crop is not None:
+                det_prob = float(matched_face.get("prob", 1.0)) if isinstance(matched_face, dict) else 1.0
+                lm_conf = (
+                    float(matched_face.get("landmark_confidence", det_prob)) if isinstance(matched_face, dict) else det_prob
+                )
+                if not np.isfinite(lm_conf):
+                    lm_conf = det_prob
+                area_component = max(0.0, face_area_ratio(matched_box, frame_bgr))
+                quality_score = area_component * max(0.0, det_prob) * max(0.0, min(1.0, lm_conf))
+                if quality_score > best_reid_face_quality:
+                    best_reid_face_quality = quality_score
+                    best_reid_face_bgr = matched_crop.copy()
+            # Incremental running mean: O(1) per step instead of O(n) re-vstack.
+            n_kept = len(kept_embeddings)
+            running_reference = running_reference + (matched_embedding - running_reference) / float(n_kept)
+            norm_val = float(np.linalg.norm(running_reference))
+            if norm_val > 1e-8:
+                running_reference = (running_reference / norm_val).astype(np.float32)
 
-    return kept_embeddings, female_score, male_score, gender_votes, diagnostics
+    return kept_embeddings, female_score, male_score, gender_votes, diagnostics, best_reid_face_bgr
+
+
+def attach_reid_to_result(
+    result: Dict[str, Any],
+    representative_face_bgr: Optional[np.ndarray],
+    cfg: Config,
+) -> None:
+    result["reid_enabled"] = bool(cfg.cross_video_reid)
+    result["reid_backend"] = REID_BACKEND_LABEL if bool(cfg.cross_video_reid) else "disabled"
+    result["reid_embedding"] = None
+    result["reid_model_tier"] = str(cfg.reid_model_tier or "balanced")
+
+    if not bool(cfg.cross_video_reid):
+        return
+    if representative_face_bgr is None or representative_face_bgr.size == 0:
+        return
+
+    try:
+        embedding = extract_reid_embedding_vector(representative_face_bgr)
+    except Exception:
+        embedding = None
+    if embedding is None:
+        return
+    result["reid_embedding"] = np.asarray(embedding, dtype=np.float32).reshape(-1).tolist()
+    result["reid_backend"] = reid_backend_label()
 
 
 def clamp_confidence(value: float) -> float:
@@ -1600,11 +2265,18 @@ def new_result_record(video_path: str, device_label: str) -> Dict[str, Any]:
         "suggested_folder_name": "",
         "memory_match_label": "",
         "memory_match_score": 0.0,
+        "memory_match_arcface_score": 0.0,
+        "memory_match_reid_score": None,
+        "memory_match_rerank_mode": "",
         "memory_applied": False,
         "learning_applied": False,
         "adaptive_threshold_used": 0.0,
         "feedback_consistency_snapshot": {},
         "memory_suggestion": "",
+        "reid_enabled": False,
+        "reid_backend": "disabled",
+        "reid_model_tier": "balanced",
+        "reid_embedding": None,
         "reason_summary": "",
         "reason_tags": [],
         "reason_metrics": empty_reason_metrics(),
@@ -1728,6 +2400,10 @@ def build_result_json_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     reason_tags = result.get("reason_tags", [])
     if not isinstance(reason_tags, list):
         reason_tags = []
+    embedding = result.get("embedding")
+    safe_embedding = _safe_embedding_vector(embedding)
+    reid_embedding = result.get("reid_embedding")
+    safe_reid_embedding = _safe_embedding_vector(reid_embedding)
     payload = {
         "video": video_path,
         "video_name": Path(video_path).name if video_path else "",
@@ -1739,10 +2415,26 @@ def build_result_json_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         "decision_reason": str(result.get("decision_reason", "")),
         "memory_match_label": str(result.get("memory_match_label", "")),
         "memory_match_score": round(_safe_float(result.get("memory_match_score", 0.0)), 4),
+        "memory_match_arcface_score": round(_safe_float(result.get("memory_match_arcface_score", 0.0)), 4),
+        "memory_match_reid_score": (
+            None
+            if result.get("memory_match_reid_score", None) is None
+            else round(_safe_float(result.get("memory_match_reid_score", 0.0)), 4)
+        ),
+        "memory_match_rerank_mode": str(result.get("memory_match_rerank_mode", "")),
         "memory_applied": bool(result.get("memory_applied", False)),
         "learning_applied": bool(result.get("learning_applied", result.get("memory_applied", False))),
         "adaptive_threshold_used": round(_safe_float(result.get("adaptive_threshold_used", 0.0)), 4),
         "feedback_consistency_snapshot": result.get("feedback_consistency_snapshot", {}),
+        "suggested_folder_name": str(result.get("suggested_folder_name", "")),
+        "suggested_cluster_id": result.get("suggested_cluster_id"),
+        "samples_used": max(0, _safe_int(result.get("samples_used", 0))),
+        "embedding": safe_embedding,
+        "reid_enabled": bool(result.get("reid_enabled", False)),
+        "reid_embedding_present": bool(safe_reid_embedding),
+        "reid_backend": str(result.get("reid_backend", "")),
+        "reid_model_tier": str(result.get("reid_model_tier", "")),
+        "reid_embedding": safe_reid_embedding,
         "stopped": bool(result.get("stopped", False)),
         "error": str(result.get("error") or ""),
     }
@@ -1834,6 +2526,7 @@ def persist_sorted_embedding_cache(
         embedding = _safe_embedding_vector(item.get("embedding"))
         if embedding is None:
             continue
+        reid_embedding = _safe_embedding_vector(item.get("reid_embedding")) or []
 
         key = _normalize_cache_key(final_destination)
         payload: SortedEmbeddingCacheEntry = {
@@ -1844,6 +2537,7 @@ def persist_sorted_embedding_cache(
             "decision_label": str(item.get("decision_label", "")).strip().lower(),
             "confidence_score": round(clamp_confidence(_safe_float(item.get("confidence_score", 0.0))), 4),
             "embedding": embedding,
+            "reid_embedding": reid_embedding,
             "updated_at": now_iso,
         }
         entries[key] = payload
@@ -1883,6 +2577,9 @@ def build_per_video_report_rows(results: Sequence[Dict[str, Any]]) -> List[Dict[
                 "reason_summary": str(item.get("reason_summary", "")).strip(),
                 "error": str(item.get("error") or "").strip(),
                 "memory_applied": bool(item.get("memory_applied", False)),
+                "reid_enabled": bool(item.get("reid_enabled", False)),
+                "reid_embedding_present": bool(item.get("reid_embedding")),
+                "reid_backend": str(item.get("reid_backend", "")).strip(),
                 "final_destination": str(item.get("final_destination", "")).strip(),
             }
         )
@@ -1988,6 +2685,9 @@ def write_run_reports(
         "reason_summary",
         "error",
         "memory_applied",
+        "reid_enabled",
+        "reid_embedding_present",
+        "reid_backend",
         "final_destination",
     ]
 
@@ -2077,7 +2777,10 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
     result["learning_applied"] = False
     result["adaptive_threshold_used"] = round(float(cfg.learning_auto_threshold), 4)
     result["feedback_consistency_snapshot"] = {}
-    result.setdefault("memory_suggestion", "")
+    result["memory_suggestion"] = str(result.get("memory_suggestion", ""))
+    result["memory_match_arcface_score"] = 0.0
+    result["memory_match_reid_score"] = None
+    result["memory_match_rerank_mode"] = ""
 
     if not cfg.learning_enabled:
         return
@@ -2091,6 +2794,13 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
         embedding,
         global_auto_threshold=cfg.learning_auto_threshold,
         global_suggest_threshold=cfg.learning_suggest_threshold,
+        default_same_person_threshold=cfg.same_person_threshold,
+        reid_embedding=result.get("reid_embedding"),
+        cross_video_reid=bool(cfg.cross_video_reid),
+        reid_fusion_weight=float(cfg.reid_fusion_weight),
+        reid_min_similarity=float(cfg.reid_min_similarity),
+        reid_ambiguity_margin_low=float(cfg.reid_ambiguity_margin_low),
+        reid_ambiguity_margin_high=float(cfg.reid_ambiguity_margin_high),
     )
     if not match:
         return
@@ -2108,6 +2818,11 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
 
     result["memory_match_label"] = label
     result["memory_match_score"] = round(score, 4)
+    result["memory_match_arcface_score"] = round(float(match.get("arcface_score", score)), 4)
+    result["memory_match_reid_score"] = (
+        None if match.get("reid_score", None) is None else round(float(match.get("reid_score", 0.0)), 4)
+    )
+    result["memory_match_rerank_mode"] = str(match.get("rerank_mode", ""))
     result["memory_suggestion"] = label
     result["adaptive_threshold_used"] = round(adaptive_auto_threshold, 4)
     result["feedback_consistency_snapshot"] = {
@@ -2192,6 +2907,7 @@ def update_learning_from_review_item(
     source_path = str(updated_item.get("source_path", ""))
     confidence = float(updated_item.get("confidence", 0.0))
     embedding = updated_item.get("embedding")
+    reid_embedding = updated_item.get("reid_embedding")
     memory_match_score = float(updated_item.get("memory_match_score", 0.0))
     source_action = f"review_{action}"
 
@@ -2206,6 +2922,7 @@ def update_learning_from_review_item(
         source_path=source_path,
         final_path=str(final_path),
         embedding=embedding,
+        reid_embedding=reid_embedding,
         memory_match_label=memory_match_label,
         memory_match_score=memory_match_score,
         from_label=predicted_label,
@@ -2249,7 +2966,7 @@ def update_learning_from_review_item(
     return True
 
 
-def process_video(video_path: str) -> Dict[str, Any]:
+def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] = None) -> Dict[str, Any]:
     assert CFG is not None
     cfg = CFG
     video_name = Path(video_path).name
@@ -2257,8 +2974,16 @@ def process_video(video_path: str) -> Dict[str, Any]:
     print(f"[START] {video_name}", flush=True)
 
     result: Dict[str, Any] = new_result_record(video_path, ACTIVE_ACCELERATION)
+    result["reid_enabled"] = bool(cfg.cross_video_reid)
+    result["reid_backend"] = REID_BACKEND_LABEL if bool(cfg.cross_video_reid) else "disabled"
+    result["reid_model_tier"] = str(cfg.reid_model_tier or "balanced")
 
-    cap = cv2.VideoCapture(video_path)
+    cap_raw = cv2.VideoCapture(video_path)
+    cap: Any
+    if prefetched_video is not None:
+        cap = PrefetchedCapture(cap_raw, prefetched_video)
+    else:
+        cap = cap_raw
     if not cap.isOpened():
         result["error"] = "Failed to open video"
         set_decision(result, "error", "Failed to open video", 0.0)
@@ -2375,8 +3100,69 @@ def process_video(video_path: str) -> Dict[str, Any]:
                 print(f"[NO FEMALE] {video_name}", flush=True)
             return result
 
+        subject_gender_label: str = str(first_gender_label or "Unknown")
+        subject_gender_confidence: float = float(first_gender_conf or 0.0)
+        subject_gender_details: Dict[str, Any] = {}
+
         while True:
-            kept_embeddings, female_score, male_score, gender_votes, stabilize_info = stabilize_identity(
+            assert first_ts is not None and first_embedding is not None
+            (
+                subject_gender_label,
+                subject_gender_confidence,
+                subject_gender_details,
+            ) = evaluate_primary_subject_gender(
+                cap=cap,
+                fps=fps,
+                total_frames=total_frames,
+                scan_duration=active_scan_end,
+                first_ts=first_ts,
+                first_embedding=first_embedding,
+                cfg=cfg,
+            )
+            result["subject_gender_ensemble"] = subject_gender_details
+            appearance_frequency = float(
+                subject_gender_details.get("appearance_frequency", subject_gender_details.get("redetection_rate", 0.0))
+            )
+            redetected_frames = int(subject_gender_details.get("redetected_frames", 0))
+            consistency_score = float(subject_gender_details.get("subject_consistency_score", 0.0))
+            avg_face_area_ratio = float(subject_gender_details.get("average_face_area_ratio", 0.0))
+
+            if (
+                subject_gender_label.lower() == "female"
+                and appearance_frequency >= cfg.subject_min_appearance_rate
+                and redetected_frames >= cfg.subject_min_frames
+                and consistency_score >= cfg.subject_min_consistency_score
+            ):
+                break
+
+            if cfg.reprocess_uncertain_only and recover_seed_from_retry("primary subject consistency weak"):
+                continue
+
+            set_decision(
+                result,
+                "uncertain",
+                (
+                    "Female candidate appears weak as a primary subject "
+                    f"(ensemble_gender={subject_gender_label}, appearance_frequency={appearance_frequency:.2f}, "
+                    f"avg_face_area_ratio={avg_face_area_ratio:.3f}, consistency_score={consistency_score:.2f}, "
+                    f"frames={redetected_frames})."
+                ),
+                0.35 + (0.35 * float(subject_gender_confidence)),
+            )
+            print(
+                f"[UNCERTAIN] {video_name} weak primary-subject consistency "
+                f"(ensemble_gender={subject_gender_label}, appearance_frequency={appearance_frequency:.3f}, "
+                f"avg_face_area_ratio={avg_face_area_ratio:.4f}, consistency_score={consistency_score:.3f}, "
+                f"frames={redetected_frames}, ensemble_conf={subject_gender_confidence:.3f})",
+                flush=True,
+            )
+            return result
+
+        first_gender_label = subject_gender_label
+        first_gender_conf = max(float(first_gender_conf or 0.0), float(subject_gender_confidence))
+
+        while True:
+            kept_embeddings, female_score, male_score, gender_votes, stabilize_info, representative_face_bgr = stabilize_identity(
                 cap=cap,
                 fps=fps,
                 total_frames=total_frames,
@@ -2449,6 +3235,7 @@ def process_video(video_path: str) -> Dict[str, Any]:
                     stable_embedding = robust_average_embeddings(kept_embeddings)
                     result["embedding"] = stable_embedding.tolist()
                     result["samples_used"] = len(kept_embeddings)
+                    attach_reid_to_result(result, representative_face_bgr, cfg)
                     set_decision(
                         result,
                         "uncertain",
@@ -2470,11 +3257,17 @@ def process_video(video_path: str) -> Dict[str, Any]:
             result["female_found"] = True
             result["embedding"] = stable_embedding.tolist()
             result["samples_used"] = len(kept_embeddings)
+            attach_reid_to_result(result, representative_face_bgr, cfg)
             set_decision(
                 result,
                 "female_detected",
                 "Consistent female detection and stabilized identity track.",
-                0.45 + (0.25 * min(1.0, len(kept_embeddings) / max(1, cfg.min_stable_embeddings))) + (0.30 * female_ratio),
+                (
+                    0.35
+                    + (0.20 * min(1.0, len(kept_embeddings) / max(1, cfg.min_stable_embeddings)))
+                    + (0.25 * female_ratio)
+                    + (0.20 * float(subject_gender_confidence))
+                ),
             )
 
             print(
@@ -2496,8 +3289,103 @@ def process_video(video_path: str) -> Dict[str, Any]:
     finally:
         cap.release()
 
-def cluster_embeddings(video_results: Sequence[Dict[str, Any]], eps: float, min_samples: int) -> Dict[str, int]:
+
+def _pairwise_cosine_distances(embeddings: Sequence[np.ndarray]) -> np.ndarray:
     vectors: List[np.ndarray] = []
+    for emb in embeddings:
+        arr = np.asarray(emb, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or not np.isfinite(arr).all():
+            continue
+        norm = float(np.linalg.norm(arr))
+        if norm <= 1e-8:
+            continue
+        vectors.append((arr / norm).astype(np.float32))
+
+    if len(vectors) < 2:
+        return np.asarray([], dtype=np.float32)
+
+    matrix = np.vstack(vectors)
+    sims = np.clip(matrix @ matrix.T, -1.0, 1.0)
+    tri = np.triu_indices(len(vectors), k=1)
+    return (1.0 - sims[tri]).astype(np.float32)
+
+
+def compute_adaptive_threshold(embeddings: Sequence[np.ndarray], fallback_threshold: float = 0.72) -> float:
+    """
+    embeddings: List[np.ndarray]
+
+    Returns:
+        float: adaptive threshold
+    """
+    distances = _pairwise_cosine_distances(embeddings)
+    if distances.size == 0:
+        return clamp_confidence(float(fallback_threshold))
+
+    mu = float(np.mean(distances))
+    sigma = float(np.std(distances))
+    adaptive_distance = mu - (2.0 * sigma)
+    adaptive_similarity = 1.0 - adaptive_distance
+    if not np.isfinite(adaptive_similarity):
+        return clamp_confidence(float(fallback_threshold))
+    return float(
+        max(
+            ADAPTIVE_SAME_PERSON_MIN_THRESHOLD,
+            min(ADAPTIVE_SAME_PERSON_MAX_THRESHOLD, adaptive_similarity),
+        )
+    )
+
+
+def build_identity_threshold_updates(
+    results: Sequence[Dict[str, Any]],
+    *,
+    fallback_threshold: float,
+) -> Dict[str, Dict[str, Any]]:
+    grouped_embeddings: Dict[str, List[np.ndarray]] = {}
+    for item in results:
+        if not bool(item.get("female_found", False)):
+            continue
+        label = sanitize_folder_name(str(item.get("suggested_folder_name", "")).strip())
+        if not label or label.lower() in {"no_female_found", "needs_review"}:
+            continue
+        emb = item.get("embedding")
+        if not isinstance(emb, list) or not emb:
+            continue
+        arr = np.asarray(emb, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or not np.isfinite(arr).all():
+            continue
+        grouped_embeddings.setdefault(label, []).append(arr)
+
+    updates: Dict[str, Dict[str, Any]] = {}
+    for label, vectors in grouped_embeddings.items():
+        distances = _pairwise_cosine_distances(vectors)
+        if distances.size == 0:
+            continue
+        mu = float(np.mean(distances))
+        sigma = float(np.std(distances))
+        threshold = compute_adaptive_threshold(vectors, fallback_threshold=fallback_threshold)
+        updates[label] = {
+            "same_person_threshold": float(threshold),
+            "intra_distance_mean": float(mu),
+            "intra_distance_std": float(sigma),
+            "intra_distance_pair_count": int(distances.size),
+            "sample_count": int(len(vectors)),
+        }
+    return updates
+
+
+def cluster_embeddings(
+    video_results: Sequence[Dict[str, Any]],
+    eps: float,
+    min_samples: int,
+    cluster_merge_threshold: float = 0.78,
+    cross_video_reid: bool = False,
+    reid_fusion_weight: float = 0.35,
+    reid_min_similarity: float = 0.55,
+    reid_ambiguity_margin_low: float = 0.08,
+    reid_ambiguity_margin_high: float = 0.06,
+) -> Dict[str, int]:
+    vectors: List[np.ndarray] = []
+    reid_vectors: List[Optional[np.ndarray]] = []
     videos: List[str] = []
 
     for item in video_results:
@@ -2509,6 +3397,15 @@ def cluster_embeddings(video_results: Sequence[Dict[str, Any]], eps: float, min_
             continue
         vec /= np.linalg.norm(vec) + 1e-8
         vectors.append(vec)
+        reid_raw = item.get("reid_embedding")
+        reid_vec: Optional[np.ndarray] = None
+        if isinstance(reid_raw, list) and reid_raw:
+            candidate = np.asarray(reid_raw, dtype=np.float32).reshape(-1)
+            if candidate.ndim == 1 and candidate.size > 0 and np.isfinite(candidate).all():
+                norm = float(np.linalg.norm(candidate))
+                if norm > 1e-8:
+                    reid_vec = (candidate / norm).astype(np.float32)
+        reid_vectors.append(reid_vec)
         videos.append(item["video"])
 
     if not vectors:
@@ -2519,13 +3416,20 @@ def cluster_embeddings(video_results: Sequence[Dict[str, Any]], eps: float, min_
     labels = dbscan.fit_predict(matrix)
 
     cluster_vectors: Dict[int, List[np.ndarray]] = {}
-    for vec, label in zip(vectors, labels):
+    cluster_reid_vectors: Dict[int, List[np.ndarray]] = {}
+    for vec, reid_vec, label in zip(vectors, reid_vectors, labels):
         cluster_vectors.setdefault(int(label), []).append(vec)
+        if reid_vec is not None:
+            cluster_reid_vectors.setdefault(int(label), []).append(reid_vec)
 
     cluster_centroids: Dict[int, np.ndarray] = {}
     for label, vecs in cluster_vectors.items():
         centroid = robust_average_embeddings(vecs)
         cluster_centroids[label] = centroid
+    cluster_reid_centroids: Dict[int, np.ndarray] = {}
+    for label, vecs in cluster_reid_vectors.items():
+        centroid = robust_average_embeddings(vecs)
+        cluster_reid_centroids[label] = centroid
 
     merged_labels: Dict[int, int] = {}
     next_group = 0
@@ -2538,7 +3442,23 @@ def cluster_embeddings(video_results: Sequence[Dict[str, Any]], eps: float, min_
         for other in labels_sorted:
             if other in merged_labels:
                 continue
-            if cosine_similarity(base, cluster_centroids[other]) >= CFG.cluster_merge_threshold:  # type: ignore[union-attr]
+            arc_sim = cosine_similarity(base, cluster_centroids[other])
+            reid_sim: Optional[float] = None
+            base_reid = cluster_reid_centroids.get(label)
+            other_reid = cluster_reid_centroids.get(other)
+            if base_reid is not None and other_reid is not None:
+                reid_sim = reid_compare_similarity(base_reid, other_reid)
+            decision = rerank_similarity(
+                arcface_similarity=arc_sim,
+                threshold=cluster_merge_threshold,
+                reid_similarity=reid_sim,
+                reid_enabled=bool(cross_video_reid),
+                reid_fusion_weight=float(reid_fusion_weight),
+                reid_min_similarity=float(reid_min_similarity),
+                reid_ambiguity_margin_low=float(reid_ambiguity_margin_low),
+                reid_ambiguity_margin_high=float(reid_ambiguity_margin_high),
+            )
+            if bool(decision.get("accepted", False)):
                 merged_labels[other] = next_group
         next_group += 1
 
@@ -2696,6 +3616,55 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-seconds", type=int, default=60, help="Only analyze the first N seconds")
     parser.add_argument("--sample-every-sec", type=float, default=2.0, help="Sparse scan interval in seconds")
+    parser.add_argument(
+        "--scene-change-aware-sampling",
+        dest="scene_change_aware_sampling",
+        action="store_true",
+        default=True,
+        help="Densify sampling near scene changes and skip static/title-like frames",
+    )
+    parser.add_argument(
+        "--no-scene-change-aware-sampling",
+        dest="scene_change_aware_sampling",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--scene-change-threshold",
+        type=float,
+        default=DEFAULT_SCENE_CHANGE_THRESHOLD,
+        help="Histogram-difference threshold for scene-change detection (0-100 scale)",
+    )
+    parser.add_argument(
+        "--scene-change-scan-step-sec",
+        type=float,
+        default=DEFAULT_SCENE_CHANGE_SCAN_STEP_SEC,
+        help="Coarse scene scan interval in seconds",
+    )
+    parser.add_argument(
+        "--scene-dense-window-sec",
+        type=float,
+        default=DEFAULT_SCENE_DENSE_WINDOW_SEC,
+        help="Dense sampling window around each detected scene change",
+    )
+    parser.add_argument(
+        "--scene-dense-step-sec",
+        type=float,
+        default=DEFAULT_SCENE_DENSE_STEP_SEC,
+        help="Dense sampling interval within scene-change windows",
+    )
+    parser.add_argument(
+        "--scene-static-std-threshold",
+        type=float,
+        default=DEFAULT_SCENE_STATIC_STD_THRESHOLD,
+        help="Std-dev threshold for static/title-like frame detection",
+    )
+    parser.add_argument(
+        "--scene-static-laplacian-threshold",
+        type=float,
+        default=DEFAULT_SCENE_STATIC_LAPLACIAN_THRESHOLD,
+        help="Laplacian variance threshold for static/title-like frame detection",
+    )
     parser.add_argument("--resize-width", type=int, default=960, help="Resize frames to this max width")
     parser.add_argument(
         "--detection-batch-size",
@@ -2746,6 +3715,66 @@ def parse_args() -> argparse.Namespace:
         help="Ignore tiny faces below this fraction of the frame area",
     )
     parser.add_argument(
+        "--subject-min-appearance-rate",
+        type=float,
+        default=MIN_PRIMARY_SUBJECT_REDETECT_RATE,
+        help="Minimum tracked-face appearance frequency required for main-subject acceptance",
+    )
+    parser.add_argument(
+        "--subject-min-frames",
+        type=int,
+        default=MIN_PRIMARY_SUBJECT_FRAMES,
+        help="Minimum number of tracked frames required for main-subject acceptance",
+    )
+    parser.add_argument(
+        "--subject-min-consistency-score",
+        type=float,
+        default=MIN_PRIMARY_SUBJECT_CONSISTENCY_SCORE,
+        help="Minimum temporal consistency score required for main-subject acceptance",
+    )
+    parser.add_argument(
+        "--subject-size-ratio-floor",
+        type=float,
+        default=PRIMARY_SUBJECT_SIZE_RATIO_FLOOR,
+        help="Lower bound for face-area ratio normalization in subject consistency scoring",
+    )
+    parser.add_argument(
+        "--subject-size-ratio-ceil",
+        type=float,
+        default=PRIMARY_SUBJECT_SIZE_RATIO_CEIL,
+        help="Upper bound for face-area ratio normalization in subject consistency scoring",
+    )
+    parser.add_argument(
+        "--fqa-min-laplacian-variance",
+        type=float,
+        default=DEFAULT_FQA_MIN_LAPLACIAN_VARIANCE,
+        help="Reject blurry faces below this Laplacian variance before embeddings",
+    )
+    parser.add_argument(
+        "--fqa-max-abs-yaw",
+        type=float,
+        default=DEFAULT_FQA_MAX_ABS_YAW,
+        help="Reject faces with absolute yaw above this threshold (degrees)",
+    )
+    parser.add_argument(
+        "--fqa-max-abs-pitch",
+        type=float,
+        default=DEFAULT_FQA_MAX_ABS_PITCH,
+        help="Reject faces with absolute pitch above this threshold (degrees)",
+    )
+    parser.add_argument(
+        "--fqa-min-landmark-confidence",
+        type=float,
+        default=DEFAULT_FQA_MIN_LANDMARK_CONFIDENCE,
+        help="Reject faces with landmark confidence below this value",
+    )
+    parser.add_argument(
+        "--fqa-min-face-size-px",
+        type=int,
+        default=MIN_GENDER_FACE_SIZE_PX,
+        help="Reject faces smaller than this size (width/height in pixels) before embeddings",
+    )
+    parser.add_argument(
         "--min-stable-embeddings",
         type=int,
         default=3,
@@ -2761,6 +3790,62 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detection-confidence", type=float, default=0.90, help="Minimum MTCNN face confidence")
     parser.add_argument("--same-person-threshold", type=float, default=0.72, help="Cosine similarity threshold")
     parser.add_argument("--duplicate-threshold", type=float, default=0.985, help="Skip near-duplicate embeddings")
+    parser.add_argument(
+        "--cross-video-reid",
+        dest="cross_video_reid",
+        action="store_true",
+        default=False,
+        help="Enable optional torchreid cross-video reranking for clustering and memory matching.",
+    )
+    parser.add_argument(
+        "--no-cross-video-reid",
+        dest="cross_video_reid",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--reid-model-tier",
+        choices=["fast", "balanced", "high_accuracy"],
+        default="balanced",
+        help="Re-ID model tier (fast/balanced/high_accuracy).",
+    )
+    parser.add_argument(
+        "--reid-min-similarity",
+        type=float,
+        default=0.55,
+        help="Minimum Re-ID cosine similarity required in ambiguous rerank region.",
+    )
+    parser.add_argument(
+        "--reid-fusion-weight",
+        type=float,
+        default=0.35,
+        help="Weight for Re-ID in fused score: fused=(1-w)*arcface + w*reid.",
+    )
+    parser.add_argument(
+        "--reid-ambiguity-margin-low",
+        type=float,
+        default=0.08,
+        help="Below threshold-margin_low => direct reject without rerank.",
+    )
+    parser.add_argument(
+        "--reid-ambiguity-margin-high",
+        type=float,
+        default=0.06,
+        help="Above threshold+margin_high => direct accept without rerank.",
+    )
+    parser.add_argument(
+        "--video-io-prefetch",
+        dest="video_io_prefetch",
+        action="store_true",
+        default=False,
+        help="Enable producer-consumer frame prefetching in single-worker mode.",
+    )
+    parser.add_argument(
+        "--no-video-io-prefetch",
+        dest="video_io_prefetch",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--dbscan-eps", type=float, default=0.35, help="DBSCAN eps with cosine distance")
     parser.add_argument("--dbscan-min-samples", type=int, default=1, help="DBSCAN min samples")
     parser.add_argument(
@@ -2980,6 +4065,13 @@ def main() -> int:
         use_insightface=bool(args.use_insightface),
         max_seconds=args.max_seconds,
         sample_every_sec=args.sample_every_sec,
+        scene_change_aware_sampling=bool(args.scene_change_aware_sampling),
+        scene_change_threshold=max(0.0, float(args.scene_change_threshold)),
+        scene_change_scan_step_sec=max(0.1, float(args.scene_change_scan_step_sec)),
+        scene_dense_window_sec=max(0.0, float(args.scene_dense_window_sec)),
+        scene_dense_step_sec=max(0.1, float(args.scene_dense_step_sec)),
+        scene_static_std_threshold=max(0.0, float(args.scene_static_std_threshold)),
+        scene_static_laplacian_threshold=max(0.0, float(args.scene_static_laplacian_threshold)),
         resize_width=args.resize_width,
         detection_batch_size=max(1, args.detection_batch_size),
         stabilization_seconds=args.stabilization_seconds,
@@ -2995,10 +4087,27 @@ def main() -> int:
         detection_confidence=args.detection_confidence,
         same_person_threshold=args.same_person_threshold,
         duplicate_threshold=args.duplicate_threshold,
+        cross_video_reid=bool(args.cross_video_reid),
+        reid_model_tier=str(args.reid_model_tier or "balanced"),
+        reid_min_similarity=float(args.reid_min_similarity),
+        reid_fusion_weight=float(args.reid_fusion_weight),
+        reid_ambiguity_margin_low=float(args.reid_ambiguity_margin_low),
+        reid_ambiguity_margin_high=float(args.reid_ambiguity_margin_high),
+        video_io_prefetch=bool(args.video_io_prefetch),
         dbscan_eps=args.dbscan_eps,
         dbscan_min_samples=args.dbscan_min_samples,
         cluster_merge_threshold=args.cluster_merge_threshold,
         max_workers=max(1, args.max_workers),
+        subject_min_appearance_rate=max(0.0, min(1.0, float(args.subject_min_appearance_rate))),
+        subject_min_frames=max(1, int(args.subject_min_frames)),
+        subject_min_consistency_score=max(0.0, min(1.0, float(args.subject_min_consistency_score))),
+        subject_size_ratio_floor=max(0.0, float(args.subject_size_ratio_floor)),
+        subject_size_ratio_ceil=max(0.0, float(args.subject_size_ratio_ceil)),
+        fqa_min_laplacian_variance=max(0.0, float(args.fqa_min_laplacian_variance)),
+        fqa_max_abs_yaw=max(0.0, float(args.fqa_max_abs_yaw)),
+        fqa_max_abs_pitch=max(0.0, float(args.fqa_max_abs_pitch)),
+        fqa_min_landmark_confidence=max(0.0, min(1.0, float(args.fqa_min_landmark_confidence))),
+        fqa_min_face_size_px=max(1, int(args.fqa_min_face_size_px)),
         gender_model_dir=args.gender_model_dir,
         gender_proto_path=args.gender_proto_path,
         gender_model_path=args.gender_model_path,
@@ -3006,10 +4115,14 @@ def main() -> int:
     cfg.learning_auto_threshold = max(0.0, min(1.0, cfg.learning_auto_threshold))
     cfg.learning_suggest_threshold = max(0.0, min(cfg.learning_auto_threshold, cfg.learning_suggest_threshold))
     cfg.review_confidence_threshold = max(0.0, min(1.0, float(cfg.review_confidence_threshold)))
-
-    proto_path, model_path = resolve_gender_model_paths(cfg)
-    cfg.gender_proto_path = str(proto_path)
-    cfg.gender_model_path = str(model_path)
+    cfg.subject_size_ratio_ceil = max(cfg.subject_size_ratio_floor + 1e-6, float(cfg.subject_size_ratio_ceil))
+    cfg.reid_model_tier = str(cfg.reid_model_tier or "balanced").strip().lower()
+    if cfg.reid_model_tier not in {"fast", "balanced", "high_accuracy"}:
+        cfg.reid_model_tier = "balanced"
+    cfg.reid_min_similarity = max(0.0, min(1.0, float(cfg.reid_min_similarity)))
+    cfg.reid_fusion_weight = max(0.0, min(1.0, float(cfg.reid_fusion_weight)))
+    cfg.reid_ambiguity_margin_low = max(0.0, float(cfg.reid_ambiguity_margin_low))
+    cfg.reid_ambiguity_margin_high = max(0.0, float(cfg.reid_ambiguity_margin_high))
 
     print_gpu_status()
 
@@ -3050,6 +4163,14 @@ def main() -> int:
         print(f"Graceful stop flag file: {cfg.stop_flag_file}")
     print(f"Live trace enabled: {cfg.live_trace}")
     print(f"Use InsightFace: {cfg.use_insightface}")
+    print(
+        "Cross-video ReID: "
+        f"enabled={cfg.cross_video_reid}, "
+        f"tier={cfg.reid_model_tier}, "
+        f"min_similarity={cfg.reid_min_similarity:.3f}, "
+        f"fusion_weight={cfg.reid_fusion_weight:.3f}, "
+        f"ambiguity_margins=({cfg.reid_ambiguity_margin_low:.3f},{cfg.reid_ambiguity_margin_high:.3f})"
+    )
     if cfg.use_insightface:
         print(
             "InsightFace tuned thresholds: "
@@ -3061,9 +4182,19 @@ def main() -> int:
         )
     if cfg.live_trace and cfg.max_workers > 1:
         print("[WARN] Live frame preview is disabled when max-workers > 1; using text trace only.")
+    if cfg.video_io_prefetch and cfg.max_workers != 1:
+        print("[WARN] Video I/O prefetch currently applies only when max-workers=1.", flush=True)
     if torch.cuda.is_available() and cfg.max_workers == 1:
         print("[HINT] GPU detected. Increase --max-workers (e.g. 2-4) to keep the GPU busier.")
     print(f"Using workers: {cfg.max_workers}")
+    print(
+        "Scene-aware sampling: "
+        f"enabled={cfg.scene_change_aware_sampling}, "
+        f"threshold={cfg.scene_change_threshold:.1f}, "
+        f"scan_step={cfg.scene_change_scan_step_sec:.2f}, "
+        f"dense_window={cfg.scene_dense_window_sec:.2f}, "
+        f"dense_step={cfg.scene_dense_step_sec:.2f}"
+    )
     print(
         "Quality settings: "
         f"confirm_frames={cfg.female_confirmation_frames}, "
@@ -3075,6 +4206,7 @@ def main() -> int:
         f"dbscan_eps={cfg.dbscan_eps}, "
         f"cluster_merge_threshold={cfg.cluster_merge_threshold}"
     )
+    print(f"Video I/O prefetch: {cfg.video_io_prefetch}")
 
     progress_disabled = not sys.stdout.isatty()
     memory_path = memory_file_path(cfg)
@@ -3092,48 +4224,127 @@ def main() -> int:
         female_hits = 0
         no_female_hits = 0
         error_hits = 0
+        prefetch_queue: Optional["queue_module.Queue[PrefetchQueueItem]"] = None
+        prefetch_stop_event: Optional[threading.Event] = None
+        prefetch_thread: Optional[threading.Thread] = None
+        prefetched_buffer: Dict[str, PrefetchQueueItem] = {}
+        prefetch_hits = 0
+        prefetch_available = 0
+
+        if bool(cfg.video_io_prefetch) and len(videos) > 1:
+            prefetch_queue = queue_module.Queue(maxsize=2)
+            prefetch_stop_event = threading.Event()
+            prefetch_thread = threading.Thread(
+                target=prefetch_video_producer,
+                args=(videos[1:], cfg, prefetch_queue, prefetch_stop_event),
+                daemon=True,
+                name="video-io-prefetch",
+            )
+            prefetch_thread.start()
+            print("[INFO] Video I/O prefetch enabled (producer-consumer mode).", flush=True)
+        elif bool(cfg.video_io_prefetch):
+            print("[INFO] Video I/O prefetch enabled but skipped (need at least 2 videos).", flush=True)
+
+        def _consume_prefetch(expected_video: Path) -> Optional[PrefetchedVideo]:
+            nonlocal prefetch_hits, prefetch_available
+            if prefetch_queue is None:
+                return None
+            expected_key = str(expected_video.resolve())
+            buffered = prefetched_buffer.pop(expected_key, None)
+            if buffered is not None:
+                if buffered.error:
+                    print(f"[WARN] Prefetch failed for {expected_video.name}: {buffered.error}", flush=True)
+                    return None
+                payload = buffered.payload
+                if payload is not None and payload.frame_map:
+                    prefetch_available += 1
+                    prefetch_hits += 1
+                return payload
+
+            while True:
+                try:
+                    item = prefetch_queue.get(timeout=0.1)
+                except queue_module.Empty:
+                    if stop_flag_is_set() and prefetch_stop_event is not None:
+                        prefetch_stop_event.set()
+                        return None
+                    continue
+                if item.video_path == "__PREFETCH_DONE__":
+                    return None
+                if item.video_path != expected_key:
+                    prefetched_buffer[item.video_path] = item
+                    continue
+                if item.error:
+                    print(f"[WARN] Prefetch failed for {expected_video.name}: {item.error}", flush=True)
+                    return None
+                payload = item.payload
+                if payload is not None and payload.frame_map:
+                    prefetch_available += 1
+                    prefetch_hits += 1
+                return payload
+
         progress = tqdm(videos, total=len(videos), desc="Processing videos", disable=progress_disabled)
-        for video in progress:
-            if stop_flag_is_set():
-                stopped_early = True
-                print("[STOP] Stop flag detected. Finishing with processed results only.", flush=True)
-                break
-            try:
-                result = process_video(str(video))
-                apply_memory_assist(result, memory, cfg)
-                apply_explainability_metadata(result, cfg)
-                emit_result_json(result)
-                results.append(result)
-            except Exception as exc:
-                result = new_result_record(str(video), ACTIVE_ACCELERATION)
-                result["error"] = f"Worker failure: {exc}"
-                set_decision(result, "error", f"Worker failure: {exc}", 0.0)
-                apply_explainability_metadata(result, cfg)
-                emit_result_json(result)
-                results.append(result)
+        try:
+            for index, video in enumerate(progress):
+                if stop_flag_is_set():
+                    stopped_early = True
+                    print("[STOP] Stop flag detected. Finishing with processed results only.", flush=True)
+                    if prefetch_stop_event is not None:
+                        prefetch_stop_event.set()
+                    break
 
-            if result.get("stopped"):
-                stopped_hits += 1
-                stopped_early = True
-                print("[STOP] Current video stopped. Finalizing already processed videos.", flush=True)
-                break
-            elif result.get("error"):
-                error_hits += 1
-            elif result.get("female_found"):
-                female_hits += 1
-            else:
-                no_female_hits += 1
+                prefetched_payload: Optional[PrefetchedVideo] = None
+                if prefetch_queue is not None and index > 0:
+                    prefetched_payload = _consume_prefetch(video)
 
-            emit_progress(len(results), len(videos), female_hits, no_female_hits, error_hits)
+                try:
+                    result = process_video(str(video), prefetched_video=prefetched_payload)
+                    apply_memory_assist(result, memory, cfg)
+                    apply_explainability_metadata(result, cfg)
+                    emit_result_json(result)
+                    results.append(result)
+                except Exception as exc:
+                    result = new_result_record(str(video), ACTIVE_ACCELERATION)
+                    result["error"] = f"Worker failure: {exc}"
+                    set_decision(result, "error", f"Worker failure: {exc}", 0.0)
+                    apply_explainability_metadata(result, cfg)
+                    emit_result_json(result)
+                    results.append(result)
 
-            if not progress_disabled:
-                progress.set_postfix(
-                    {
-                        "done": len(results),
-                        "female": female_hits,
-                        "no_female": no_female_hits,
-                        "errors": error_hits,
-                    }
+                if result.get("stopped"):
+                    stopped_hits += 1
+                    stopped_early = True
+                    print("[STOP] Current video stopped. Finalizing already processed videos.", flush=True)
+                    if prefetch_stop_event is not None:
+                        prefetch_stop_event.set()
+                    break
+                elif result.get("error"):
+                    error_hits += 1
+                elif result.get("female_found"):
+                    female_hits += 1
+                else:
+                    no_female_hits += 1
+
+                emit_progress(len(results), len(videos), female_hits, no_female_hits, error_hits)
+
+                if not progress_disabled:
+                    progress.set_postfix(
+                        {
+                            "done": len(results),
+                            "female": female_hits,
+                            "no_female": no_female_hits,
+                            "errors": error_hits,
+                        }
+                    )
+        finally:
+            if prefetch_stop_event is not None:
+                prefetch_stop_event.set()
+            if prefetch_thread is not None:
+                prefetch_thread.join(timeout=2.0)
+            if prefetch_queue is not None:
+                print(
+                    f"[PREFETCH] consumed={prefetch_available} hits={prefetch_hits} pending_buffer={len(prefetched_buffer)}",
+                    flush=True,
                 )
     else:
         executor = ProcessPoolExecutor(max_workers=cfg.max_workers, initializer=init_worker, initargs=(cfg,))
@@ -3230,7 +4441,17 @@ def main() -> int:
         close_live_preview()
         return 1
 
-    cluster_map = cluster_embeddings(results, cfg.dbscan_eps, cfg.dbscan_min_samples)
+    cluster_map = cluster_embeddings(
+        results,
+        cfg.dbscan_eps,
+        cfg.dbscan_min_samples,
+        cfg.cluster_merge_threshold,
+        cfg.cross_video_reid,
+        cfg.reid_fusion_weight,
+        cfg.reid_min_similarity,
+        cfg.reid_ambiguity_margin_low,
+        cfg.reid_ambiguity_margin_high,
+    )
     cluster_folder_names = build_cluster_folder_names(cluster_map)
     if cluster_folder_names:
         print("\n[CLUSTERS]")
@@ -3250,6 +4471,30 @@ def main() -> int:
         cluster_id_int = int(cluster_id)
         item["suggested_cluster_id"] = cluster_id_int
         item["suggested_folder_name"] = cluster_folder_names.get(cluster_id_int, f"Female_{cluster_id_int}")
+
+    if cfg.learning_enabled:
+        threshold_updates = build_identity_threshold_updates(
+            successful_results,
+            fallback_threshold=cfg.same_person_threshold,
+        )
+        if threshold_updates:
+            for label, payload in threshold_updates.items():
+                set_identity_same_person_threshold(
+                    memory,
+                    label=label,
+                    same_person_threshold=float(payload.get("same_person_threshold", cfg.same_person_threshold)),
+                    intra_distance_mean=float(payload.get("intra_distance_mean", 0.0)),
+                    intra_distance_std=float(payload.get("intra_distance_std", 0.0)),
+                    intra_distance_pair_count=int(payload.get("intra_distance_pair_count", 0)),
+                    global_auto_threshold=cfg.learning_auto_threshold,
+                    global_suggest_threshold=cfg.learning_suggest_threshold,
+                )
+            save_memory(memory_path, memory)
+            print(
+                f"[ADAPTIVE_THRESHOLD] updated_identities={len(threshold_updates)} "
+                f"memory={memory_path}",
+                flush=True,
+            )
 
     female_count = 0
     uncertain_count = 0
@@ -3301,6 +4546,7 @@ def main() -> int:
                         "confidence": float(item.get("confidence_score", 0.0)),
                         "suggested_folder": suggested_folder,
                         "embedding": item.get("embedding"),
+                        "reid_embedding": item.get("reid_embedding"),
                         "memory_suggestion": str(item.get("memory_suggestion", "")),
                         "memory_match_label": str(item.get("memory_match_label", "")),
                         "memory_match_score": float(item.get("memory_match_score", 0.0)),
@@ -3340,6 +4586,7 @@ def main() -> int:
                     "confidence": float(item.get("confidence_score", 0.0)),
                     "suggested_folder": suggested_folder,
                     "embedding": item.get("embedding"),
+                    "reid_embedding": item.get("reid_embedding"),
                     "memory_suggestion": str(item.get("memory_suggestion", "")),
                     "memory_match_label": str(item.get("memory_match_label", "")),
                     "memory_match_score": float(item.get("memory_match_score", 0.0)),

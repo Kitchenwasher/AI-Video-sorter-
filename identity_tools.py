@@ -105,7 +105,9 @@ def _apply_learning_feedback_from_cache_entry(
         return False
     embedding = cache_entry.get("embedding")
     embedding_vec = normalize_embedding(embedding if isinstance(embedding, list) else [])
-    if embedding_vec is None:
+    reid_embedding = cache_entry.get("reid_embedding")
+    reid_embedding_vec = normalize_embedding(reid_embedding if isinstance(reid_embedding, list) else [])
+    if embedding_vec is None and reid_embedding_vec is None:
         return False
 
     confidence = _safe_float(cache_entry.get("confidence_score", 0.0), 0.0)
@@ -122,7 +124,8 @@ def _apply_learning_feedback_from_cache_entry(
         confidence=confidence,
         source_path=source_path,
         final_path=final_path,
-        embedding=embedding_vec.tolist(),
+        embedding=embedding_vec.tolist() if embedding_vec is not None else None,
+        reid_embedding=reid_embedding_vec.tolist() if reid_embedding_vec is not None else None,
         from_label=from_label,
         to_label=to_label,
     )
@@ -159,6 +162,17 @@ def _normalize_identity_record(identity: Dict[str, Any], label: str) -> Dict[str
     normalized["correction_consistency_score"] = float(normalized.get("correction_consistency_score", 0.0) or 0.0)
     normalized["adaptive_auto_threshold"] = float(normalized.get("adaptive_auto_threshold", 0.82) or 0.82)
     normalized["last_corrected_at"] = str(normalized.get("last_corrected_at", "") or "")
+    reid_proto = normalized.get("reid_prototype", [])
+    normalized["reid_prototype"] = reid_proto if isinstance(reid_proto, list) else []
+    normalized["reid_sample_count"] = int(normalized.get("reid_sample_count", 0) or 0)
+    normalized["reid_last_used"] = str(normalized.get("reid_last_used", "") or "")
+    reid_same_person_threshold = normalized.get("reid_same_person_threshold", None)
+    try:
+        normalized["reid_same_person_threshold"] = (
+            None if reid_same_person_threshold is None else float(reid_same_person_threshold)
+        )
+    except Exception:
+        normalized["reid_same_person_threshold"] = None
     return normalized
 
 
@@ -219,6 +233,10 @@ def _ensure_identity(memory: Dict[str, Any], label: str) -> Dict[str, Any]:
         "correction_consistency_score": 0.0,
         "adaptive_auto_threshold": 0.82,
         "last_corrected_at": "",
+        "reid_prototype": [],
+        "reid_sample_count": 0,
+        "reid_last_used": "",
+        "reid_same_person_threshold": None,
     }
     identities = memory.setdefault("identities", [])
     if not isinstance(identities, list):
@@ -296,6 +314,29 @@ def _merge_prototypes(target: Dict[str, Any], source: Dict[str, Any]) -> None:
     source_corrected = str(source.get("last_corrected_at", "") or "")
     if source_corrected and (not target_corrected or source_corrected > target_corrected):
         target["last_corrected_at"] = source_corrected
+
+    target_reid_proto = normalize_embedding(target.get("reid_prototype", []))
+    source_reid_proto = normalize_embedding(source.get("reid_prototype", []))
+    target_reid_count = int(target.get("reid_sample_count", 0) or 0)
+    source_reid_count = int(source.get("reid_sample_count", 0) or 0)
+
+    if target_reid_proto is not None and source_reid_proto is not None and (target_reid_count + source_reid_count) > 0:
+        merged_reid = (target_reid_proto * max(0, target_reid_count)) + (source_reid_proto * max(0, source_reid_count))
+        merged_reid = normalize_embedding(merged_reid.tolist())  # type: ignore[arg-type]
+        if merged_reid is not None:
+            target["reid_prototype"] = merged_reid.tolist()
+    elif source_reid_proto is not None:
+        target["reid_prototype"] = source_reid_proto.tolist()
+    elif target_reid_proto is not None:
+        target["reid_prototype"] = target_reid_proto.tolist()
+
+    target["reid_sample_count"] = max(0, target_reid_count) + max(0, source_reid_count)
+    target_reid_last = str(target.get("reid_last_used", "") or "")
+    source_reid_last = str(source.get("reid_last_used", "") or "")
+    if source_reid_last and (not target_reid_last or source_reid_last > target_reid_last):
+        target["reid_last_used"] = source_reid_last
+    if target.get("reid_same_person_threshold", None) is None and source.get("reid_same_person_threshold", None) is not None:
+        target["reid_same_person_threshold"] = source.get("reid_same_person_threshold")
 
 
 def _append_structural_event(

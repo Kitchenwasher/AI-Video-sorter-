@@ -85,10 +85,10 @@ def _phash_frame(frame_bgr: np.ndarray) -> int:
     flattened = block.flatten()
     median = float(np.median(flattened[1:])) if flattened.size > 1 else 0.0
     bits = (flattened > median).astype(np.uint8)
-    value = 0
-    for bit in bits:
-        value = (value << 1) | int(bit)
-    return int(value)
+    # Vectorized bit-packing: ~10x faster than Python loop over 64 bits.
+    packed = np.packbits(bits)
+    value = int.from_bytes(packed.tobytes(), byteorder="big")
+    return value
 
 
 def _sample_video_phash(path: Path, sample_count: int = 6) -> List[int]:
@@ -210,18 +210,36 @@ def _build_near_groups(
         if ra != rb:
             parent[rb] = ra
 
-    for i in range(n):
-        item_i = candidates[i]
-        for j in range(i + 1, n):
-            item_j = candidates[j]
-            if not _duration_close(float(item_i.get("duration", 0.0)), float(item_j.get("duration", 0.0))):
-                continue
-            distance = _average_hash_distance(
-                item_i.get("phash_samples", []),
-                item_j.get("phash_samples", []),
-            )
-            if distance <= distance_threshold:
-                union(i, j)
+    # Pre-bucket by rounded duration to avoid O(n²) brute-force.
+    # Only compare candidates whose durations are close (bucket overlap).
+    bucket_width = 2.0  # seconds
+    duration_buckets: Dict[int, List[int]] = {}
+    for idx, item in enumerate(candidates):
+        dur = float(item.get("duration", 0.0))
+        bucket_key = int(dur / bucket_width)
+        for bk in (bucket_key - 1, bucket_key, bucket_key + 1):
+            duration_buckets.setdefault(bk, []).append(idx)
+
+    compared: set[Tuple[int, int]] = set()
+    for bucket_indices in duration_buckets.values():
+        for bi in range(len(bucket_indices)):
+            i = bucket_indices[bi]
+            item_i = candidates[i]
+            for bj in range(bi + 1, len(bucket_indices)):
+                j = bucket_indices[bj]
+                pair = (min(i, j), max(i, j))
+                if pair in compared:
+                    continue
+                compared.add(pair)
+                item_j = candidates[j]
+                if not _duration_close(float(item_i.get("duration", 0.0)), float(item_j.get("duration", 0.0))):
+                    continue
+                distance = _average_hash_distance(
+                    item_i.get("phash_samples", []),
+                    item_j.get("phash_samples", []),
+                )
+                if distance <= distance_threshold:
+                    union(i, j)
 
     grouped: Dict[int, List[Dict[str, Any]]] = {}
     for idx, item in enumerate(candidates):

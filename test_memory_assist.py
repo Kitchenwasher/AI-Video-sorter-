@@ -189,6 +189,41 @@ class MemoryAssistTests(unittest.TestCase):
         self.assertEqual(result["decision_label"], "uncertain")
         self.assertAlmostEqual(float(result["adaptive_threshold_used"]), cfg.learning_auto_threshold, places=3)
 
+    def test_reid_ambiguous_match_auto_applies_when_enabled(self) -> None:
+        cfg = self._cfg()
+        cfg.cross_video_reid = True
+        cfg.reid_fusion_weight = 0.35
+        cfg.reid_min_similarity = 0.55
+        cfg.reid_ambiguity_margin_low = 0.08
+        cfg.reid_ambiguity_margin_high = 0.06
+        memory = {
+            "identities": [
+                {
+                    "label": "Female_ReID",
+                    "prototype": [1.0, 0.0, 0.0],
+                    "sample_count": 1,
+                    "confidence_sum": 1.0,
+                    "same_person_threshold": 0.80,
+                    "reid_prototype": [1.0, 0.0, 0.0],
+                    "reid_sample_count": 1,
+                }
+            ]
+        }
+        result = {
+            "decision_label": "uncertain",
+            "decision_reason": "native confidence low",
+            "confidence_score": 0.30,
+            "embedding": [0.79, 0.61, 0.0],
+            "reid_embedding": [0.98, 0.02, 0.0],
+            "female_found": False,
+            "suggested_folder_name": "",
+        }
+
+        apply_memory_assist(result, memory, cfg)
+        self.assertTrue(result["memory_applied"])
+        self.assertEqual(result["decision_label"], "female_detected")
+        self.assertEqual(result["suggested_folder_name"], "Female_ReID")
+
 
 if __name__ == "__main__":
     unittest.main()

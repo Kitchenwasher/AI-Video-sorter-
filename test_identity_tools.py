@@ -200,6 +200,7 @@ class IdentityToolsTests(unittest.TestCase):
                         "decision_label": "female_detected",
                         "confidence_score": 0.91,
                         "embedding": [1.0, 0.0, 0.0],
+                        "reid_embedding": [1.0, 0.0, 0.0],
                         "updated_at": "2026-04-14T10:00:00+00:00",
                     }
                 },
@@ -219,6 +220,8 @@ class IdentityToolsTests(unittest.TestCase):
             self.assertEqual(result["details"]["learning_feedback_events"], 2)
 
             updated = load_memory(mem_path)
+            merged_identity = next(item for item in updated.get("identities", []) if item.get("label") == "Female_B")
+            self.assertGreaterEqual(int(merged_identity.get("reid_sample_count", 0) or 0), 1)
             self.assertTrue(
                 any(
                     str(item.get("source_action", "")) == "identity_merge"

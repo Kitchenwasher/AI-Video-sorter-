@@ -50,6 +50,112 @@ def _normalize_embedding(raw_embedding: Optional[Sequence[float]]) -> Optional[n
     return (arr / norm).astype(np.float32)
 
 
+def _normalize_gender(raw_gender: Any) -> Optional[int]:
+    """Normalize InsightFace gender to 0=female, 1=male."""
+    if raw_gender is None:
+        return None
+    try:
+        if isinstance(raw_gender, np.ndarray):
+            if raw_gender.size == 0:
+                return None
+            value = float(raw_gender.reshape(-1)[0])
+        else:
+            value = float(raw_gender)
+    except Exception:
+        return None
+
+    idx = int(round(value))
+    if idx in (0, 1):
+        return idx
+    return None
+
+
+def _normalize_age(raw_age: Any) -> Optional[float]:
+    if raw_age is None:
+        return None
+    try:
+        if isinstance(raw_age, np.ndarray):
+            if raw_age.size == 0:
+                return None
+            value = float(raw_age.reshape(-1)[0])
+        else:
+            value = float(raw_age)
+    except Exception:
+        return None
+    return max(0.0, value)
+
+
+def _extract_pose(raw_pose: Any) -> Tuple[Optional[float], Optional[float]]:
+    """Return (yaw, pitch) from InsightFace pose payload when available."""
+    if raw_pose is None:
+        return None, None
+    try:
+        arr = np.asarray(raw_pose, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None, None
+    if arr.size < 2:
+        return None, None
+    yaw = float(arr[0]) if np.isfinite(arr[0]) else None
+    pitch = float(arr[1]) if np.isfinite(arr[1]) else None
+    return yaw, pitch
+
+
+def _landmark_confidence(face_obj: Any) -> Optional[float]:
+    """Estimate landmark confidence in [0,1] with lightweight heuristics."""
+    explicit = None
+    for attr in ("landmark_confidence", "kps_score", "landmark_score"):
+        value = getattr(face_obj, attr, None)
+        if value is None:
+            continue
+        try:
+            arr = np.asarray(value, dtype=np.float32).reshape(-1)
+            if arr.size == 0:
+                continue
+            explicit = float(np.nanmean(arr))
+            break
+        except Exception:
+            continue
+
+    finite_ratio: Optional[float] = None
+    for attr in ("kps", "landmark_2d_106", "landmark_3d_68"):
+        points = getattr(face_obj, attr, None)
+        if points is None:
+            continue
+        try:
+            pts = np.asarray(points, dtype=np.float32)
+            if pts.size == 0:
+                continue
+            pts = pts.reshape(-1, pts.shape[-1] if pts.ndim > 1 else 1)
+            finite_ratio = float(np.mean(np.isfinite(pts).all(axis=1)))
+            break
+        except Exception:
+            continue
+
+    det_score = getattr(face_obj, "det_score", None)
+    try:
+        det_norm = float(det_score) if det_score is not None else None
+    except Exception:
+        det_norm = None
+    if det_norm is not None:
+        det_norm = max(0.0, min(1.0, det_norm))
+
+    if explicit is not None:
+        conf = max(0.0, min(1.0, explicit))
+        if finite_ratio is not None:
+            conf *= max(0.0, min(1.0, finite_ratio))
+        if det_norm is not None:
+            conf *= det_norm
+        return conf
+
+    if finite_ratio is not None:
+        conf = max(0.0, min(1.0, finite_ratio))
+        if det_norm is not None:
+            conf *= det_norm
+        return conf
+
+    return det_norm
+
+
 def _resize_for_detection(image_bgr: np.ndarray, max_side: int = _MAX_DETECTION_SIDE) -> Tuple[np.ndarray, float]:
     """Resize very large frames for faster detection; return resized frame + reverse scale."""
     height, width = image_bgr.shape[:2]
@@ -170,6 +276,7 @@ def get_faces(image: np.ndarray) -> List[Dict[str, Any]]:
         if embedding_raw is None:
             embedding_raw = getattr(face, "embedding", None)
         embedding = _normalize_embedding(embedding_raw)
+        pose_yaw, pose_pitch = _extract_pose(getattr(face, "pose", None))
 
         detections.append(
             {
@@ -177,6 +284,11 @@ def get_faces(image: np.ndarray) -> List[Dict[str, Any]]:
                 "prob": float(getattr(face, "det_score", 1.0)),
                 "area": float((x2 - x1) * (y2 - y1)),
                 "embedding": embedding,
+                "gender": _normalize_gender(getattr(face, "gender", None)),
+                "age": _normalize_age(getattr(face, "age", None)),
+                "pose_yaw": pose_yaw,
+                "pose_pitch": pose_pitch,
+                "landmark_confidence": _landmark_confidence(face),
             }
         )
 

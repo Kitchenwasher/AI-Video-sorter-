@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from reid_fusion import rerank_similarity
 
 
 MEMORY_SCHEMA_VERSION = 1
@@ -122,6 +123,15 @@ def _normalize_identity_record(
     normalized.setdefault("correction_consistency_score", 0.0)
     normalized.setdefault("adaptive_auto_threshold", global_auto_threshold)
     normalized.setdefault("last_corrected_at", "")
+    normalized.setdefault("same_person_threshold", None)
+    normalized.setdefault("intra_distance_mean", None)
+    normalized.setdefault("intra_distance_std", None)
+    normalized.setdefault("intra_distance_pair_count", 0)
+    normalized.setdefault("same_person_threshold_updated_at", "")
+    normalized.setdefault("reid_prototype", [])
+    normalized.setdefault("reid_sample_count", 0)
+    normalized.setdefault("reid_last_used", "")
+    normalized.setdefault("reid_same_person_threshold", None)
 
     positive = max(0, int(normalized.get("positive_feedback_count", 0) or 0))
     negative = max(0, int(normalized.get("negative_feedback_count", 0) or 0))
@@ -132,6 +142,42 @@ def _normalize_identity_record(
     normalized["last_used"] = str(normalized.get("last_used", "") or "")
     normalized["locked_at"] = str(normalized.get("locked_at", "") or "")
     normalized["last_corrected_at"] = str(normalized.get("last_corrected_at", "") or "")
+    normalized["same_person_threshold_updated_at"] = str(normalized.get("same_person_threshold_updated_at", "") or "")
+    normalized["intra_distance_pair_count"] = max(0, int(normalized.get("intra_distance_pair_count", 0) or 0))
+    normalized["reid_sample_count"] = max(0, int(normalized.get("reid_sample_count", 0) or 0))
+    normalized["reid_last_used"] = str(normalized.get("reid_last_used", "") or "")
+    reid_proto = normalized.get("reid_prototype", [])
+    if not isinstance(reid_proto, list):
+        reid_proto = []
+    normalized["reid_prototype"] = reid_proto
+
+    same_person_threshold = normalized.get("same_person_threshold", None)
+    try:
+        same_person_threshold = None if same_person_threshold is None else _clamp(float(same_person_threshold), 0.0, 1.0)
+    except Exception:
+        same_person_threshold = None
+    normalized["same_person_threshold"] = same_person_threshold
+    reid_same_person_threshold = normalized.get("reid_same_person_threshold", None)
+    try:
+        reid_same_person_threshold = (
+            None
+            if reid_same_person_threshold is None
+            else _clamp(float(reid_same_person_threshold), 0.0, 1.0)
+        )
+    except Exception:
+        reid_same_person_threshold = None
+    normalized["reid_same_person_threshold"] = reid_same_person_threshold
+
+    try:
+        intra_mean = None if normalized.get("intra_distance_mean", None) is None else float(normalized.get("intra_distance_mean"))
+    except Exception:
+        intra_mean = None
+    try:
+        intra_std = None if normalized.get("intra_distance_std", None) is None else float(normalized.get("intra_distance_std"))
+    except Exception:
+        intra_std = None
+    normalized["intra_distance_mean"] = intra_mean
+    normalized["intra_distance_std"] = intra_std
 
     consistency = compute_correction_consistency_score(positive, negative)
     adaptive = compute_adaptive_auto_threshold(
@@ -228,10 +274,18 @@ def match_identity(
     *,
     global_auto_threshold: float = DEFAULT_LEARNING_AUTO_THRESHOLD,
     global_suggest_threshold: float = DEFAULT_LEARNING_SUGGEST_THRESHOLD,
+    default_same_person_threshold: float = 0.0,
+    reid_embedding: Optional[Sequence[float]] = None,
+    cross_video_reid: bool = False,
+    reid_fusion_weight: float = 0.35,
+    reid_min_similarity: float = 0.55,
+    reid_ambiguity_margin_low: float = 0.08,
+    reid_ambiguity_margin_high: float = 0.06,
 ) -> Optional[Dict[str, Any]]:
     query = normalize_embedding(embedding)
     if query is None:
         return None
+    query_reid = normalize_embedding(reid_embedding or [])
 
     refresh_all_identity_stats(
         memory,
@@ -242,7 +296,7 @@ def match_identity(
     if not isinstance(identities, list) or not identities:
         return None
 
-    best: Optional[Tuple[int, Dict[str, Any], float]] = None
+    best: Optional[Tuple[int, Dict[str, Any], float, Dict[str, Any]]] = None
     for idx, identity in enumerate(identities):
         if not isinstance(identity, dict):
             continue
@@ -254,23 +308,88 @@ def match_identity(
         if prototype_vec is None:
             continue
         score = cosine_similarity(query, prototype_vec)
-        if best is None or score > best[2]:
-            best = (idx, identity, score)
+        threshold_raw = identity.get("same_person_threshold", default_same_person_threshold)
+        try:
+            identity_threshold = _clamp(float(threshold_raw), 0.0, 1.0)
+        except Exception:
+            identity_threshold = _clamp(float(default_same_person_threshold), 0.0, 1.0)
+
+        reid_score: Optional[float] = None
+        reid_proto = normalize_embedding(identity.get("reid_prototype", []))
+        if query_reid is not None and reid_proto is not None:
+            reid_score = cosine_similarity(query_reid, reid_proto)
+
+        rerank = rerank_similarity(
+            arcface_similarity=score,
+            threshold=identity_threshold,
+            reid_similarity=reid_score,
+            reid_enabled=bool(cross_video_reid),
+            reid_fusion_weight=float(reid_fusion_weight),
+            reid_min_similarity=float(reid_min_similarity),
+            reid_ambiguity_margin_low=float(reid_ambiguity_margin_low),
+            reid_ambiguity_margin_high=float(reid_ambiguity_margin_high),
+        )
+        if not bool(rerank.get("accepted", False)):
+            continue
+        fused_score = float(rerank.get("fused_score", score))
+        if best is None or fused_score > best[2]:
+            best = (idx, identity, fused_score, rerank)
 
     if best is None:
         return None
 
-    _, identity, score = best
+    _, identity, score, rerank = best
     return {
         "identity_index": best[0],
         "label": str(identity.get("label", "")).strip(),
         "score": round(float(score), 4),
+        "arcface_score": round(float(rerank.get("arcface_score", score)), 4),
+        "reid_score": (
+            None
+            if rerank.get("reid_score", None) is None
+            else round(float(rerank.get("reid_score", 0.0)), 4)
+        ),
+        "fused_score": round(float(rerank.get("fused_score", score)), 4),
+        "rerank_mode": str(rerank.get("mode", "")),
         "locked": bool(identity.get("locked", False)),
         "adaptive_auto_threshold": float(identity.get("adaptive_auto_threshold", global_auto_threshold)),
         "correction_consistency_score": float(identity.get("correction_consistency_score", 0.0)),
         "positive_feedback_count": int(identity.get("positive_feedback_count", 0) or 0),
         "negative_feedback_count": int(identity.get("negative_feedback_count", 0) or 0),
+        "same_person_threshold": (
+            _clamp(float(identity.get("same_person_threshold", default_same_person_threshold)), 0.0, 1.0)
+            if identity.get("same_person_threshold", None) is not None
+            else _clamp(float(default_same_person_threshold), 0.0, 1.0)
+        ),
     }
+
+
+def set_identity_same_person_threshold(
+    memory: Dict[str, Any],
+    *,
+    label: str,
+    same_person_threshold: float,
+    intra_distance_mean: float,
+    intra_distance_std: float,
+    intra_distance_pair_count: int,
+    global_auto_threshold: float = DEFAULT_LEARNING_AUTO_THRESHOLD,
+    global_suggest_threshold: float = DEFAULT_LEARNING_SUGGEST_THRESHOLD,
+) -> None:
+    clean_label = str(label or "").strip()
+    if not clean_label:
+        return
+
+    identity = _ensure_identity(
+        memory,
+        clean_label,
+        global_auto_threshold=global_auto_threshold,
+        global_suggest_threshold=global_suggest_threshold,
+    )
+    identity["same_person_threshold"] = _clamp(float(same_person_threshold), 0.0, 1.0)
+    identity["intra_distance_mean"] = float(intra_distance_mean)
+    identity["intra_distance_std"] = float(intra_distance_std)
+    identity["intra_distance_pair_count"] = max(0, int(intra_distance_pair_count))
+    identity["same_person_threshold_updated_at"] = utc_now_iso()
 
 
 def _record_decision(memory: Dict[str, Any], decision: Dict[str, Any]) -> None:
@@ -347,6 +466,10 @@ def _ensure_identity(
             "positive_feedback_count": 0,
             "negative_feedback_count": 0,
             "last_corrected_at": "",
+            "reid_prototype": [],
+            "reid_sample_count": 0,
+            "reid_last_used": "",
+            "reid_same_person_threshold": None,
         },
         global_auto_threshold=global_auto_threshold,
         global_suggest_threshold=global_suggest_threshold,
@@ -362,8 +485,9 @@ def _ensure_identity(
 def _update_identity(
     memory: Dict[str, Any],
     label: str,
-    embedding: np.ndarray,
+    embedding: Optional[np.ndarray],
     confidence: float,
+    reid_embedding: Optional[np.ndarray] = None,
     *,
     global_auto_threshold: float,
     global_suggest_threshold: float,
@@ -375,24 +499,40 @@ def _update_identity(
         global_suggest_threshold=global_suggest_threshold,
     )
 
-    old_proto = normalize_embedding(target.get("prototype", []))
-    sample_count = int(target.get("sample_count", 0))
-    if old_proto is None or sample_count <= 0:
-        target["prototype"] = embedding.astype(np.float32).tolist()
-        target["sample_count"] = 1
-        target["confidence_sum"] = float(confidence)
-        target["last_used"] = utc_now_iso()
-        return
+    if embedding is not None:
+        old_proto = normalize_embedding(target.get("prototype", []))
+        sample_count = int(target.get("sample_count", 0))
+        if old_proto is None or sample_count <= 0:
+            target["prototype"] = embedding.astype(np.float32).tolist()
+            target["sample_count"] = 1
+            target["confidence_sum"] = float(confidence)
+            target["last_used"] = utc_now_iso()
+        else:
+            merged = ((old_proto * sample_count) + embedding) / float(sample_count + 1)
+            merged_norm = normalize_embedding(merged)
+            if merged_norm is None:
+                merged_norm = embedding
 
-    merged = ((old_proto * sample_count) + embedding) / float(sample_count + 1)
-    merged_norm = normalize_embedding(merged)
-    if merged_norm is None:
-        merged_norm = embedding
+            target["prototype"] = merged_norm.astype(np.float32).tolist()
+            target["sample_count"] = sample_count + 1
+            target["confidence_sum"] = float(target.get("confidence_sum", 0.0)) + float(confidence)
+            target["last_used"] = utc_now_iso()
 
-    target["prototype"] = merged_norm.astype(np.float32).tolist()
-    target["sample_count"] = sample_count + 1
-    target["confidence_sum"] = float(target.get("confidence_sum", 0.0)) + float(confidence)
-    target["last_used"] = utc_now_iso()
+    if reid_embedding is not None:
+        old_reid = normalize_embedding(target.get("reid_prototype", []))
+        reid_count = int(target.get("reid_sample_count", 0) or 0)
+        if old_reid is None or reid_count <= 0:
+            target["reid_prototype"] = reid_embedding.astype(np.float32).tolist()
+            target["reid_sample_count"] = 1
+            target["reid_last_used"] = utc_now_iso()
+        else:
+            merged_reid = ((old_reid * reid_count) + reid_embedding) / float(reid_count + 1)
+            merged_reid_norm = normalize_embedding(merged_reid)
+            if merged_reid_norm is None:
+                merged_reid_norm = reid_embedding
+            target["reid_prototype"] = merged_reid_norm.astype(np.float32).tolist()
+            target["reid_sample_count"] = reid_count + 1
+            target["reid_last_used"] = utc_now_iso()
 
 
 def record_feedback(
@@ -405,6 +545,7 @@ def record_feedback(
     source_path: str,
     final_path: str,
     embedding: Optional[Sequence[float]] = None,
+    reid_embedding: Optional[Sequence[float]] = None,
     memory_match_label: str = "",
     memory_match_score: float = 0.0,
     feedback_event_type: str = "",
@@ -427,15 +568,17 @@ def record_feedback(
 
     final_label = str(label or "").strip()
     emb_vec = normalize_embedding(embedding or [])
+    reid_vec = normalize_embedding(reid_embedding or [])
 
     if final_label.lower() == "no_female_found":
         stats["total_no_female_events"] = int(stats.get("total_no_female_events", 0)) + 1
-    elif emb_vec is not None and final_label:
+    elif (emb_vec is not None or reid_vec is not None) and final_label:
         _update_identity(
             memory,
             final_label,
             emb_vec,
             confidence,
+            reid_embedding=reid_vec,
             global_auto_threshold=global_auto_threshold,
             global_suggest_threshold=global_suggest_threshold,
         )
@@ -489,7 +632,7 @@ def record_feedback(
             "memory_match_score": memory_match_score,
             "source_path": source_path,
             "final_path": final_path,
-            "embedding_present": emb_vec is not None,
+            "embedding_present": emb_vec is not None or reid_vec is not None,
         },
     )
 
@@ -567,10 +710,33 @@ def build_learning_summary(
                 "label": label,
                 "locked": bool(identity.get("locked", False)),
                 "sample_count": int(identity.get("sample_count", 0) or 0),
+                "reid_sample_count": int(identity.get("reid_sample_count", 0) or 0),
                 "positive_feedback_count": positive,
                 "negative_feedback_count": negative,
                 "correction_consistency_score": round(float(identity.get("correction_consistency_score", 0.0)), 4),
                 "adaptive_auto_threshold": round(float(identity.get("adaptive_auto_threshold", global_auto_threshold)), 4),
+                "same_person_threshold": (
+                    None
+                    if identity.get("same_person_threshold", None) is None
+                    else round(float(identity.get("same_person_threshold", 0.0)), 4)
+                ),
+                "reid_same_person_threshold": (
+                    None
+                    if identity.get("reid_same_person_threshold", None) is None
+                    else round(float(identity.get("reid_same_person_threshold", 0.0)), 4)
+                ),
+                "intra_distance_mean": (
+                    None
+                    if identity.get("intra_distance_mean", None) is None
+                    else round(float(identity.get("intra_distance_mean", 0.0)), 4)
+                ),
+                "intra_distance_std": (
+                    None
+                    if identity.get("intra_distance_std", None) is None
+                    else round(float(identity.get("intra_distance_std", 0.0)), 4)
+                ),
+                "intra_distance_pair_count": int(identity.get("intra_distance_pair_count", 0) or 0),
+                "same_person_threshold_updated_at": str(identity.get("same_person_threshold_updated_at", "") or ""),
                 "last_corrected_at": str(identity.get("last_corrected_at", "") or ""),
                 "last_used": str(identity.get("last_used", "") or ""),
                 "recent_trend": _correction_trend(positive, negative),

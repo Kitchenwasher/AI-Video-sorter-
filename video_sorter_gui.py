@@ -14,14 +14,22 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
+
+try:
+    import umap  # type: ignore[import-not-found]
+except Exception:
+    umap = None
 
 
 APP_TITLE = "Female Face Video Sorter"
@@ -44,6 +52,10 @@ DARK_MUTED = "#9aa4b2"
 DARK_ACCENT = "#3b82f6"
 DARK_ACCENT_ACTIVE = "#2563eb"
 LOG_MAX_LINES = 3000
+DASH_SPEED_HISTORY_MAX = 180
+DASH_CONFIDENCE_HISTORY_MAX = 3000
+DASH_CLUSTER_MAX_POINTS = 500
+DASH_SPEED_ROLLING_WINDOW_SEC = 300.0
 PROFILE_DEFAULT_FIELDS: dict[str, dict[str, str]] = {
     "Fast": {
         "max_seconds": "40",
@@ -142,6 +154,11 @@ class VideoSorterGUI:
         self.learning_button_var = tk.StringVar()
         self.use_insightface_var = tk.BooleanVar(value=True)
         self.face_engine_button_var = tk.StringVar()
+        self.cross_video_reid_var = tk.BooleanVar(value=False)
+        self.cross_video_reid_button_var = tk.StringVar()
+        self.reid_model_tier_var = tk.StringVar(value="balanced")
+        self.video_io_prefetch_var = tk.BooleanVar(value=False)
+        self.video_io_prefetch_button_var = tk.StringVar()
         self.live_trace_var = tk.BooleanVar(value=False)
         self.live_trace_button_var = tk.StringVar()
         self.max_seconds_var = tk.StringVar(value="60")
@@ -156,6 +173,9 @@ class VideoSorterGUI:
         self.live_status_var = tk.StringVar(value="Live: idle")
         self.progress_status_var = tk.StringVar(value="Progress: 0/0 videos")
         self.review_status_var = tk.StringVar(value="Review Queue: 0 pending")
+        self.dashboard_speed_var = tk.StringVar(value="Speed: -- videos/min")
+        self.dashboard_eta_var = tk.StringVar(value="ETA (rolling): --")
+        self.dashboard_projection_var = tk.StringVar(value="Projection: waiting for embeddings")
 
         self.review_window: tk.Toplevel | None = None
         self.review_items: list[dict] = []
@@ -178,6 +198,23 @@ class VideoSorterGUI:
         self.duplicate_groups_tree: ttk.Treeview | None = None
         self.duplicate_items_tree: ttk.Treeview | None = None
         self.duplicate_groups_map: dict[str, dict] = {}
+        self.dashboard_speed_canvas: tk.Canvas | None = None
+        self.dashboard_conf_canvas: tk.Canvas | None = None
+        self.dashboard_cluster_canvas: tk.Canvas | None = None
+        self.dashboard_progress_points: deque[tuple[float, int]] = deque()
+        self.dashboard_speed_points: deque[float] = deque(maxlen=DASH_SPEED_HISTORY_MAX)
+        self.dashboard_confidences: deque[float] = deque(maxlen=DASH_CONFIDENCE_HISTORY_MAX)
+        self.dashboard_embeddings: list[np.ndarray] = []
+        self.dashboard_labels: list[str] = []
+        self.dashboard_cluster_points_2d: np.ndarray | None = None
+        self.dashboard_cluster_colors: list[str] = []
+        self.dashboard_cluster_last_len = 0
+        self.dashboard_total_videos = 0
+        self.dashboard_last_done = 0
+        self.dashboard_projection_last_method = ""
+        self.dashboard_last_projection_at = 0.0
+        self.dashboard_embedding_version = 0
+        self.dashboard_cluster_projected_version = -1
         self.main_scroll_canvas: tk.Canvas | None = None
         self.main_scroll_content: ttk.Frame | None = None
         self.main_scroll_window_id: int | None = None
@@ -188,8 +225,11 @@ class VideoSorterGUI:
         self._update_learning_button_text()
         self._update_face_engine_button_text()
         self._update_face_engine_status_text()
+        self._update_cross_video_reid_button_text()
+        self._update_video_io_prefetch_button_text()
         self._update_live_trace_button_text()
         self._build_ui()
+        self._dashboard_reset()
         self._update_reprocess_button_state()
         self._refresh_runtime_status()
         self._refresh_review_queue_status()
@@ -215,6 +255,7 @@ class VideoSorterGUI:
         content.columnconfigure(0, weight=1)
         content.rowconfigure(3, weight=1, minsize=140)
         content.rowconfigure(4, weight=0, minsize=120)
+        content.rowconfigure(5, weight=0, minsize=220)
         window_id = canvas.create_window((0, 0), window=content, anchor="nw")
 
         self.main_scroll_canvas = canvas
@@ -367,6 +408,16 @@ class VideoSorterGUI:
 
         ttk.Label(options, text="Max Workers").grid(row=5, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(options, textvariable=self.max_workers_var, width=12).grid(row=6, column=0, sticky="ew", pady=(0, 2))
+        ttk.Button(
+            options,
+            textvariable=self.video_io_prefetch_button_var,
+            command=self._toggle_video_io_prefetch,
+        ).grid(row=5, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
+        ttk.Button(
+            options,
+            textvariable=self.cross_video_reid_button_var,
+            command=self._toggle_cross_video_reid,
+        ).grid(row=6, column=1, sticky="ew", padx=(0, 10), pady=(0, 2))
 
         ttk.Label(
             options,
@@ -428,8 +479,48 @@ class VideoSorterGUI:
         result_scroll.grid(row=0, column=1, sticky="ns")
         self.results_tree.configure(yscrollcommand=result_scroll.set)
 
+        dashboard_frame = ttk.LabelFrame(content, text="Batch Processing Dashboard", padding=10)
+        dashboard_frame.grid(row=5, column=0, sticky="ew", padx=14, pady=(0, 10))
+        dashboard_frame.columnconfigure(0, weight=1)
+        dashboard_frame.columnconfigure(1, weight=1)
+        dashboard_frame.columnconfigure(2, weight=1)
+
+        ttk.Label(dashboard_frame, textvariable=self.dashboard_speed_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(dashboard_frame, textvariable=self.dashboard_eta_var).grid(row=0, column=1, sticky="w")
+        ttk.Label(dashboard_frame, textvariable=self.dashboard_projection_var).grid(row=0, column=2, sticky="w")
+
+        self.dashboard_speed_canvas = tk.Canvas(
+            dashboard_frame,
+            width=260,
+            height=120,
+            bg="#0f1318",
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+        )
+        self.dashboard_speed_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(8, 0))
+
+        self.dashboard_conf_canvas = tk.Canvas(
+            dashboard_frame,
+            width=260,
+            height=120,
+            bg="#0f1318",
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+        )
+        self.dashboard_conf_canvas.grid(row=1, column=1, sticky="nsew", padx=(0, 8), pady=(8, 0))
+
+        self.dashboard_cluster_canvas = tk.Canvas(
+            dashboard_frame,
+            width=320,
+            height=120,
+            bg="#0f1318",
+            highlightthickness=1,
+            highlightbackground=DARK_BORDER,
+        )
+        self.dashboard_cluster_canvas.grid(row=1, column=2, sticky="nsew", pady=(8, 0))
+
         footer = ttk.Frame(content, padding=(14, 0, 14, 14))
-        footer.grid(row=5, column=0, sticky="ew")
+        footer.grid(row=6, column=0, sticky="ew")
         footer.columnconfigure(1, weight=1)
         footer.columnconfigure(2, weight=1)
         footer.columnconfigure(3, weight=1)
@@ -506,6 +597,337 @@ class VideoSorterGUI:
             return
         self.results_tree.insert("", "end", values=format_result_row(payload))
 
+    def _dashboard_reset(self) -> None:
+        self.dashboard_progress_points.clear()
+        self.dashboard_speed_points.clear()
+        self.dashboard_confidences.clear()
+        self.dashboard_embeddings.clear()
+        self.dashboard_labels.clear()
+        self.dashboard_cluster_points_2d = None
+        self.dashboard_cluster_colors.clear()
+        self.dashboard_cluster_last_len = 0
+        self.dashboard_total_videos = 0
+        self.dashboard_last_done = 0
+        self.dashboard_projection_last_method = ""
+        self.dashboard_last_projection_at = 0.0
+        self.dashboard_embedding_version = 0
+        self.dashboard_cluster_projected_version = -1
+        self.dashboard_speed_var.set("Speed: -- videos/min")
+        self.dashboard_eta_var.set("ETA (rolling): --")
+        self.dashboard_projection_var.set("Projection: waiting for embeddings")
+        self._dashboard_draw_speed_trend()
+        self._dashboard_draw_confidence_histogram()
+        self._dashboard_draw_cluster_projection()
+
+    @staticmethod
+    def _dashboard_clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _dashboard_format_duration(seconds: float) -> str:
+        total_seconds = max(0, int(round(seconds)))
+        hours, rem = divmod(total_seconds, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+        if minutes > 0:
+            return f"{minutes:d}m {secs:02d}s"
+        return f"{secs:d}s"
+
+    @staticmethod
+    def _dashboard_canvas_size(canvas: tk.Canvas, fallback_width: int, fallback_height: int) -> tuple[int, int]:
+        width = int(canvas.winfo_width())
+        height = int(canvas.winfo_height())
+        if width < 40:
+            width = int(float(canvas.cget("width")))
+        if height < 40:
+            height = int(float(canvas.cget("height")))
+        return max(width, fallback_width), max(height, fallback_height)
+
+    @staticmethod
+    def _dashboard_identity_label_from_payload(payload: dict) -> str:
+        candidates = (
+            str(payload.get("suggested_folder_name", "")).strip(),
+            str(payload.get("memory_match_label", "")).strip(),
+            str(payload.get("decision_label", "")).strip(),
+        )
+        for label in candidates:
+            if label:
+                return label
+        return "unknown"
+
+    def _dashboard_update_from_result(self, payload: dict) -> None:
+        try:
+            confidence = float(payload.get("confidence_score", 0.0))
+        except Exception:
+            confidence = 0.0
+        self.dashboard_confidences.append(self._dashboard_clamp01(confidence))
+        self._dashboard_draw_confidence_histogram()
+
+        embedding_raw = payload.get("embedding")
+        embedding_added = False
+        if isinstance(embedding_raw, list) and embedding_raw:
+            try:
+                vector = np.asarray(embedding_raw, dtype=np.float32).reshape(-1)
+            except Exception:
+                vector = np.asarray([], dtype=np.float32)
+            if vector.size > 0 and np.isfinite(vector).all():
+                norm = float(np.linalg.norm(vector))
+                if norm > 1e-8:
+                    vector = (vector / norm).astype(np.float32)
+                    self.dashboard_embeddings.append(vector)
+                    self.dashboard_labels.append(self._dashboard_identity_label_from_payload(payload))
+                    if len(self.dashboard_embeddings) > DASH_CLUSTER_MAX_POINTS:
+                        self.dashboard_embeddings = self.dashboard_embeddings[-DASH_CLUSTER_MAX_POINTS:]
+                        self.dashboard_labels = self.dashboard_labels[-DASH_CLUSTER_MAX_POINTS:]
+                    self.dashboard_embedding_version += 1
+                    embedding_added = True
+
+        if embedding_added:
+            self._dashboard_maybe_refresh_projection(force=False)
+        elif not self.dashboard_embeddings:
+            self.dashboard_projection_var.set("Projection: waiting for embeddings")
+            self._dashboard_draw_cluster_projection()
+
+    def _dashboard_update_from_progress(self, done: int, total: int) -> None:
+        now = time.time()
+        done = max(0, int(done))
+        total = max(0, int(total))
+        self.dashboard_last_done = done
+        self.dashboard_total_videos = max(self.dashboard_total_videos, total)
+
+        if not self.dashboard_progress_points:
+            self.dashboard_progress_points.append((now, done))
+        else:
+            last_time, last_done = self.dashboard_progress_points[-1]
+            if done != last_done:
+                self.dashboard_progress_points.append((now, done))
+            else:
+                self.dashboard_progress_points[-1] = (now, done)
+
+        cutoff = now - DASH_SPEED_ROLLING_WINDOW_SEC
+        while len(self.dashboard_progress_points) > 1 and self.dashboard_progress_points[1][0] < cutoff:
+            self.dashboard_progress_points.popleft()
+
+        speed = 0.0
+        if len(self.dashboard_progress_points) >= 2:
+            start_time, start_done = self.dashboard_progress_points[0]
+            end_time, end_done = self.dashboard_progress_points[-1]
+            dt = max(1e-6, float(end_time - start_time))
+            dd = max(0, int(end_done) - int(start_done))
+            speed = (dd / dt) * 60.0
+
+        self.dashboard_speed_points.append(speed)
+        self.dashboard_speed_var.set(f"Speed: {speed:.2f} videos/min")
+        if total > 0 and done >= total:
+            self.dashboard_eta_var.set("ETA (rolling): complete")
+        elif speed > 1e-6 and total > 0:
+            remaining = max(0, total - done)
+            eta_seconds = (remaining / speed) * 60.0
+            self.dashboard_eta_var.set(f"ETA (rolling): {self._dashboard_format_duration(eta_seconds)}")
+        else:
+            self.dashboard_eta_var.set("ETA (rolling): --")
+        self._dashboard_draw_speed_trend()
+
+    def _dashboard_project_embeddings(self, matrix: np.ndarray) -> tuple[np.ndarray, str]:
+        if matrix.shape[0] < 2:
+            return np.zeros((0, 2), dtype=np.float32), "waiting"
+
+        if umap is not None and matrix.shape[0] >= 3:
+            try:
+                neighbors = max(2, min(15, matrix.shape[0] - 1))
+                reducer = umap.UMAP(  # type: ignore[attr-defined]
+                    n_components=2,
+                    n_neighbors=neighbors,
+                    min_dist=0.15,
+                    metric="cosine",
+                    random_state=42,
+                )
+                points = reducer.fit_transform(matrix).astype(np.float32)
+                return points, "UMAP"
+            except Exception:
+                pass
+
+        centered = matrix - matrix.mean(axis=0, keepdims=True)
+        try:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+            basis = vh[:2].T if vh.shape[0] >= 2 else np.zeros((centered.shape[1], 2), dtype=np.float32)
+            points = centered @ basis
+        except Exception:
+            axis = np.arange(matrix.shape[0], dtype=np.float32)
+            points = np.column_stack((axis, np.zeros_like(axis)))
+        return np.asarray(points, dtype=np.float32), "PCA fallback"
+
+    @staticmethod
+    def _dashboard_color_for_label(label: str) -> str:
+        palette = (
+            "#60a5fa",
+            "#34d399",
+            "#f59e0b",
+            "#f87171",
+            "#22d3ee",
+            "#a78bfa",
+            "#fbbf24",
+            "#2dd4bf",
+            "#fb7185",
+            "#93c5fd",
+        )
+        return palette[hash(label) % len(palette)]
+
+    def _dashboard_maybe_refresh_projection(self, force: bool = False) -> None:
+        total = len(self.dashboard_embeddings)
+        if total == 0:
+            self.dashboard_cluster_points_2d = None
+            self.dashboard_cluster_colors = []
+            self.dashboard_cluster_last_len = 0
+            self.dashboard_projection_var.set("Projection: waiting for embeddings")
+            self._dashboard_draw_cluster_projection()
+            return
+
+        if total < 2:
+            self.dashboard_cluster_points_2d = None
+            self.dashboard_cluster_colors = []
+            self.dashboard_cluster_last_len = total
+            self.dashboard_projection_var.set(f"Projection: need >=2 embeddings (n={total})")
+            self._dashboard_draw_cluster_projection()
+            return
+
+        now = time.time()
+        should_project = force
+        if self.dashboard_cluster_projected_version != self.dashboard_embedding_version:
+            delta = self.dashboard_embedding_version - self.dashboard_cluster_projected_version
+            if total <= 30 or delta >= 5 or (now - self.dashboard_last_projection_at) >= 1.5:
+                should_project = True
+
+        if not should_project:
+            self._dashboard_draw_cluster_projection()
+            return
+
+        matrix = np.vstack(self.dashboard_embeddings).astype(np.float32)
+        points, method = self._dashboard_project_embeddings(matrix)
+        self.dashboard_cluster_points_2d = points
+        self.dashboard_cluster_colors = [self._dashboard_color_for_label(label) for label in self.dashboard_labels]
+        self.dashboard_cluster_last_len = total
+        self.dashboard_projection_last_method = method
+        self.dashboard_last_projection_at = now
+        self.dashboard_cluster_projected_version = self.dashboard_embedding_version
+        self.dashboard_projection_var.set(f"Projection: {method} (n={total})")
+        self._dashboard_draw_cluster_projection()
+
+    def _dashboard_draw_speed_trend(self) -> None:
+        canvas = self.dashboard_speed_canvas
+        if canvas is None:
+            return
+        width, height = self._dashboard_canvas_size(canvas, 260, 120)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#0f1318", outline="")
+
+        margin = 10
+        left = margin
+        right = width - margin
+        top = margin
+        bottom = height - margin - 8
+        canvas.create_line(left, bottom, right, bottom, fill=DARK_BORDER)
+        canvas.create_line(left, top, left, bottom, fill=DARK_BORDER)
+
+        points = list(self.dashboard_speed_points)
+        if not points:
+            canvas.create_text(width // 2, height // 2, text="Waiting for progress...", fill=DARK_MUTED)
+            return
+
+        max_speed = max(1.0, max(points))
+        if len(points) == 1:
+            x = (left + right) / 2.0
+            y = bottom - ((points[0] / max_speed) * max(1.0, (bottom - top)))
+            canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=DARK_ACCENT, outline="")
+            return
+
+        polyline: list[float] = []
+        span_x = max(1.0, float(right - left))
+        span_y = max(1.0, float(bottom - top))
+        for idx, value in enumerate(points):
+            x = left + (idx / max(1, len(points) - 1)) * span_x
+            y = bottom - ((max(0.0, value) / max_speed) * span_y)
+            polyline.extend([x, y])
+        canvas.create_line(*polyline, fill=DARK_ACCENT, width=2, smooth=True)
+        canvas.create_text(right, top, text=f"{max_speed:.1f}", fill=DARK_MUTED, anchor="ne")
+
+    def _dashboard_draw_confidence_histogram(self) -> None:
+        canvas = self.dashboard_conf_canvas
+        if canvas is None:
+            return
+        width, height = self._dashboard_canvas_size(canvas, 260, 120)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#0f1318", outline="")
+
+        margin = 10
+        left = margin
+        right = width - margin
+        top = margin
+        bottom = height - margin - 10
+        canvas.create_line(left, bottom, right, bottom, fill=DARK_BORDER)
+        canvas.create_line(left, top, left, bottom, fill=DARK_BORDER)
+
+        values = list(self.dashboard_confidences)
+        if not values:
+            canvas.create_text(width // 2, height // 2, text="No confidence samples yet", fill=DARK_MUTED)
+            return
+
+        bins = 10
+        hist = [0] * bins
+        for value in values:
+            idx = min(bins - 1, int(value * bins))
+            hist[idx] += 1
+
+        max_count = max(1, max(hist))
+        bar_width = max(1.0, (right - left) / bins)
+        for idx, count in enumerate(hist):
+            x0 = left + idx * bar_width + 1
+            x1 = left + (idx + 1) * bar_width - 1
+            bar_height = (count / max_count) * max(1.0, (bottom - top))
+            y0 = bottom - bar_height
+            canvas.create_rectangle(x0, y0, x1, bottom, fill="#22d3ee", outline="")
+        canvas.create_text(right, top, text=f"n={len(values)}", fill=DARK_MUTED, anchor="ne")
+
+    def _dashboard_draw_cluster_projection(self) -> None:
+        canvas = self.dashboard_cluster_canvas
+        if canvas is None:
+            return
+        width, height = self._dashboard_canvas_size(canvas, 320, 120)
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#0f1318", outline="")
+
+        points = self.dashboard_cluster_points_2d
+        if points is None or points.size == 0 or points.shape[0] < 2:
+            canvas.create_text(width // 2, height // 2, text="Need more embeddings...", fill=DARK_MUTED)
+            return
+
+        margin = 10
+        left = margin
+        right = width - margin
+        top = margin
+        bottom = height - margin
+        canvas.create_rectangle(left, top, right, bottom, outline=DARK_BORDER, fill="")
+
+        xs = points[:, 0]
+        ys = points[:, 1]
+        x_min = float(np.min(xs))
+        x_max = float(np.max(xs))
+        y_min = float(np.min(ys))
+        y_max = float(np.max(ys))
+        x_span = max(1e-6, x_max - x_min)
+        y_span = max(1e-6, y_max - y_min)
+
+        colors = self.dashboard_cluster_colors
+        for idx in range(points.shape[0]):
+            x = left + ((float(xs[idx]) - x_min) / x_span) * max(1.0, (right - left))
+            y = bottom - ((float(ys[idx]) - y_min) / y_span) * max(1.0, (bottom - top))
+            color = colors[idx] if idx < len(colors) else DARK_ACCENT
+            canvas.create_oval(x - 2, y - 2, x + 2, y + 2, fill=color, outline="")
+
+        method = self.dashboard_projection_last_method or "projection"
+        canvas.create_text(right, top, text=method, fill=DARK_MUTED, anchor="ne")
+
     def _update_include_generated_button_text(self) -> None:
         if self.include_generated_var.get():
             self.include_generated_button_var.set("Generated Folders: Included")
@@ -537,6 +959,22 @@ class VideoSorterGUI:
         else:
             self.face_engine_status_var.set(f"Face Engine: selected {selected}")
 
+    def _update_cross_video_reid_button_text(self) -> None:
+        tier = str(self.reid_model_tier_var.get() or "balanced").strip().lower()
+        if tier not in {"fast", "balanced", "high_accuracy"}:
+            tier = "balanced"
+            self.reid_model_tier_var.set(tier)
+        if self.cross_video_reid_var.get():
+            self.cross_video_reid_button_var.set(f"Cross-Video ReID: On ({tier})")
+        else:
+            self.cross_video_reid_button_var.set(f"Cross-Video ReID: Off ({tier})")
+
+    def _update_video_io_prefetch_button_text(self) -> None:
+        if self.video_io_prefetch_var.get():
+            self.video_io_prefetch_button_var.set("Video I/O Prefetch: On")
+        else:
+            self.video_io_prefetch_button_var.set("Video I/O Prefetch: Off")
+
     def _update_live_trace_button_text(self) -> None:
         if self.live_trace_var.get():
             self.live_trace_button_var.set("Live Preview: On")
@@ -562,6 +1000,16 @@ class VideoSorterGUI:
         self.use_insightface_var.set(not self.use_insightface_var.get())
         self._update_face_engine_button_text()
         self._update_face_engine_status_text()
+        self._save_settings()
+
+    def _toggle_cross_video_reid(self) -> None:
+        self.cross_video_reid_var.set(not self.cross_video_reid_var.get())
+        self._update_cross_video_reid_button_text()
+        self._save_settings()
+
+    def _toggle_video_io_prefetch(self) -> None:
+        self.video_io_prefetch_var.set(not self.video_io_prefetch_var.get())
+        self._update_video_io_prefetch_button_text()
         self._save_settings()
 
     def _toggle_live_trace(self) -> None:
@@ -599,12 +1047,17 @@ class VideoSorterGUI:
         self.review_mode_var.set(bool(data.get("review_mode", False)))
         self.learning_enabled_var.set(bool(data.get("learning_enabled", True)))
         self.use_insightface_var.set(bool(data.get("use_insightface", True)))
+        self.cross_video_reid_var.set(bool(data.get("cross_video_reid", False)))
+        self.reid_model_tier_var.set(str(data.get("reid_model_tier", "balanced")))
+        self.video_io_prefetch_var.set(bool(data.get("video_io_prefetch", False)))
         self.live_trace_var.set(bool(data.get("live_trace", False)))
         self._update_include_generated_button_text()
         self._update_review_mode_button_text()
         self._update_learning_button_text()
         self._update_face_engine_button_text()
         self._update_face_engine_status_text()
+        self._update_cross_video_reid_button_text()
+        self._update_video_io_prefetch_button_text()
         self._update_live_trace_button_text()
         self.max_seconds_var.set(str(data.get("max_seconds", "60")))
         self.sample_every_var.set(str(data.get("sample_every_sec", "2.0")))
@@ -623,6 +1076,9 @@ class VideoSorterGUI:
             "review_mode": self.review_mode_var.get(),
             "learning_enabled": self.learning_enabled_var.get(),
             "use_insightface": self.use_insightface_var.get(),
+            "cross_video_reid": self.cross_video_reid_var.get(),
+            "reid_model_tier": str(self.reid_model_tier_var.get().strip() or "balanced"),
+            "video_io_prefetch": self.video_io_prefetch_var.get(),
             "live_trace": self.live_trace_var.get(),
             "max_seconds": self.max_seconds_var.get().strip(),
             "sample_every_sec": self.sample_every_var.get().strip(),
@@ -737,6 +1193,15 @@ class VideoSorterGUI:
             command.append("--use-insightface")
         else:
             command.append("--no-use-insightface")
+        if self.cross_video_reid_var.get():
+            command.append("--cross-video-reid")
+        else:
+            command.append("--no-cross-video-reid")
+        command.extend(["--reid-model-tier", str(self.reid_model_tier_var.get().strip() or "balanced")])
+        if self.video_io_prefetch_var.get():
+            command.append("--video-io-prefetch")
+        else:
+            command.append("--no-video-io-prefetch")
         if self.live_trace_var.get():
             command.append("--live-trace")
         return command
@@ -1882,6 +2347,7 @@ class VideoSorterGUI:
         self.reprocess_uncertain_button.configure(state="disabled")
         self.progress.configure(value=0, maximum=100)
         self._clear_results_table()
+        self._dashboard_reset()
 
         self.process = subprocess.Popen(
             command,
@@ -1926,10 +2392,12 @@ class VideoSorterGUI:
                 self._clear_stop_flag()
                 self._refresh_review_queue_status()
                 self._update_reprocess_button_state()
+                self._dashboard_maybe_refresh_projection(force=True)
             else:
                 result_payload = parse_result_json_line(item)
                 if result_payload is not None:
                     self._append_result_row(result_payload)
+                    self._dashboard_update_from_result(result_payload)
                     continue
                 if item.startswith("[TRACE] "):
                     self.live_status_var.set(item.replace("[TRACE] ", "Live: ").strip())
@@ -1959,6 +2427,7 @@ class VideoSorterGUI:
                     self.progress_status_var.set(
                         f"Progress: {done}/{total} videos | female={female} | no_female={no_female} | errors={errors}"
                     )
+                    self._dashboard_update_from_progress(done, total)
                 log_chunks.append(item)
 
         if log_chunks:
