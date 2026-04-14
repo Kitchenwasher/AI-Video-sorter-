@@ -1,7 +1,14 @@
 import json
 import unittest
 
-from video_sorter_gui import RESULT_JSON_PREFIX, format_result_row, parse_result_json_line
+from video_sorter_gui import (
+    RESULT_JSON_PREFIX,
+    combine_log_chunks,
+    compute_log_trim_lines,
+    format_result_row,
+    parse_result_json_line,
+    resolve_profile_defaults,
+)
 
 
 class GuiResultsTests(unittest.TestCase):
@@ -39,6 +46,18 @@ class GuiResultsTests(unittest.TestCase):
         self.assertEqual(row[2], "0.900")
         self.assertEqual(row[3], "Stable and consistent evidence.")
         self.assertEqual(row[4], "few_stable_embeddings, memory_match_suggested")
+
+    def test_balanced_profile_defaults_use_two_workers(self) -> None:
+        defaults = resolve_profile_defaults("Balanced")
+        self.assertEqual(defaults["max_workers"], "2")
+        self.assertEqual(defaults["sample_every_sec"], "2.0")
+        self.assertEqual(defaults["stabilization_seconds"], "8.0")
+
+    def test_log_helpers_are_deterministic(self) -> None:
+        joined = combine_log_chunks(["a\n", "b\n", "c\n"])
+        self.assertEqual(joined, "a\nb\nc\n")
+        self.assertEqual(compute_log_trim_lines(3000, 3000), 0)
+        self.assertEqual(compute_log_trim_lines(3005, 3000), 5)
 
 
 if __name__ == "__main__":

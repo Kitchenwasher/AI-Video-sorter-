@@ -13,9 +13,28 @@ from review_queue import (
 
 class ReviewQueueTests(unittest.TestCase):
     def test_queue_routing_review_mode(self) -> None:
-        self.assertEqual(decide_review_route({"decision_label": "female_detected"}, review_mode=True), "queue")
         self.assertEqual(decide_review_route({"decision_label": "uncertain"}, review_mode=True), "queue")
         self.assertEqual(decide_review_route({"decision_label": "no_female"}, review_mode=True), "direct_no_female")
+        self.assertEqual(
+            decide_review_route({"decision_label": "female_detected", "confidence_score": 0.60}, review_mode=True),
+            "queue",
+        )
+        self.assertEqual(
+            decide_review_route({"decision_label": "female_detected", "confidence_score": 0.75}, review_mode=True),
+            "direct",
+        )
+        self.assertEqual(
+            decide_review_route({"decision_label": "female_detected", "confidence_score": 0.95}, review_mode=True),
+            "direct",
+        )
+        self.assertEqual(
+            decide_review_route(
+                {"decision_label": "female_detected", "confidence_score": 0.74},
+                review_mode=True,
+                review_confidence_threshold=0.70,
+            ),
+            "direct",
+        )
         self.assertEqual(decide_review_route({"decision_label": "female_detected"}, review_mode=False), "direct")
 
     def test_review_state_atomic_skip_transition(self) -> None:

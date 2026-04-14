@@ -36,6 +36,37 @@ PROFILE_TO_BACKEND = {
     "High Accuracy": "high_accuracy",
 }
 BACKEND_TO_PROFILE = {value: key for key, value in PROFILE_TO_BACKEND.items()}
+DARK_BG = "#15181d"
+DARK_SURFACE = "#1f242c"
+DARK_BORDER = "#2b3240"
+DARK_TEXT = "#e6edf3"
+DARK_MUTED = "#9aa4b2"
+DARK_ACCENT = "#3b82f6"
+DARK_ACCENT_ACTIVE = "#2563eb"
+LOG_MAX_LINES = 3000
+PROFILE_DEFAULT_FIELDS: dict[str, dict[str, str]] = {
+    "Fast": {
+        "max_seconds": "40",
+        "sample_every_sec": "2.5",
+        "stabilization_seconds": "6.0",
+        "resize_width": "720",
+        "max_workers": "2",
+    },
+    "Balanced": {
+        "max_seconds": "60",
+        "sample_every_sec": "2.0",
+        "stabilization_seconds": "8.0",
+        "resize_width": "960",
+        "max_workers": "2",
+    },
+    "High Accuracy": {
+        "max_seconds": "90",
+        "sample_every_sec": "1.0",
+        "stabilization_seconds": "10.0",
+        "resize_width": "1152",
+        "max_workers": "1",
+    },
+}
 
 
 def parse_result_json_line(line: str) -> dict | None:
@@ -72,12 +103,27 @@ def format_result_row(payload: dict) -> tuple[str, str, str, str, str]:
     return video_name, decision, confidence, reason_summary, tags
 
 
+def resolve_profile_defaults(profile_name: str) -> dict[str, str]:
+    selected = profile_name.strip()
+    if selected not in PROFILE_DEFAULT_FIELDS:
+        selected = "Balanced"
+    return dict(PROFILE_DEFAULT_FIELDS[selected])
+
+
+def combine_log_chunks(chunks: list[str]) -> str:
+    return "".join(chunks)
+
+
+def compute_log_trim_lines(total_lines: int, max_lines: int = LOG_MAX_LINES) -> int:
+    return max(0, int(total_lines) - int(max_lines))
+
+
 class VideoSorterGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
         self.root.geometry("940x760")
-        self.root.minsize(820, 620)
+        self.root.minsize(860, 640)
 
         self.process: subprocess.Popen[str] | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -94,16 +140,19 @@ class VideoSorterGUI:
         self.review_mode_button_var = tk.StringVar()
         self.learning_enabled_var = tk.BooleanVar(value=True)
         self.learning_button_var = tk.StringVar()
+        self.use_insightface_var = tk.BooleanVar(value=True)
+        self.face_engine_button_var = tk.StringVar()
         self.live_trace_var = tk.BooleanVar(value=False)
         self.live_trace_button_var = tk.StringVar()
         self.max_seconds_var = tk.StringVar(value="60")
         self.sample_every_var = tk.StringVar(value="2.0")
         self.stabilization_var = tk.StringVar(value="8.0")
         self.resize_width_var = tk.StringVar(value="960")
-        self.max_workers_var = tk.StringVar(value="1")
+        self.max_workers_var = tk.StringVar(value="2")
         self.profile_var = tk.StringVar(value="Balanced")
         self.status_var = tk.StringVar(value="Ready")
         self.runtime_var = tk.StringVar(value="Runtime: checking...")
+        self.face_engine_status_var = tk.StringVar(value="Face Engine: InsightFace (selected)")
         self.live_status_var = tk.StringVar(value="Live: idle")
         self.progress_status_var = tk.StringVar(value="Progress: 0/0 videos")
         self.review_status_var = tk.StringVar(value="Review Queue: 0 pending")
@@ -129,11 +178,16 @@ class VideoSorterGUI:
         self.duplicate_groups_tree: ttk.Treeview | None = None
         self.duplicate_items_tree: ttk.Treeview | None = None
         self.duplicate_groups_map: dict[str, dict] = {}
+        self.main_scroll_canvas: tk.Canvas | None = None
+        self.main_scroll_content: ttk.Frame | None = None
+        self.main_scroll_window_id: int | None = None
 
         self._load_settings()
         self._update_include_generated_button_text()
         self._update_review_mode_button_text()
         self._update_learning_button_text()
+        self._update_face_engine_button_text()
+        self._update_face_engine_status_text()
         self._update_live_trace_button_text()
         self._build_ui()
         self._update_reprocess_button_state()
@@ -144,10 +198,79 @@ class VideoSorterGUI:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=2)
-        self.root.rowconfigure(4, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
-        top = ttk.Frame(self.root, padding=14)
+        shell = ttk.Frame(self.root)
+        shell.grid(row=0, column=0, sticky="nsew")
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(shell, highlightthickness=0, borderwidth=0, bg=DARK_BG)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vscroll = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
+        vscroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        content = ttk.Frame(canvas)
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(3, weight=1, minsize=140)
+        content.rowconfigure(4, weight=0, minsize=120)
+        window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        self.main_scroll_canvas = canvas
+        self.main_scroll_content = content
+        self.main_scroll_window_id = window_id
+
+        def _sync_scroll_region(_event: tk.Event[tk.Misc]) -> None:
+            if self.main_scroll_canvas is None:
+                return
+            self.main_scroll_canvas.configure(scrollregion=self.main_scroll_canvas.bbox("all"))
+
+        def _fit_content_width(event: tk.Event[tk.Misc]) -> None:
+            if self.main_scroll_canvas is None or self.main_scroll_window_id is None:
+                return
+            self.main_scroll_canvas.itemconfigure(self.main_scroll_window_id, width=event.width)
+
+        def _on_mousewheel(event: tk.Event[tk.Misc]) -> None:
+            if self.main_scroll_canvas is None:
+                return
+            delta = int(getattr(event, "delta", 0))
+            if delta != 0:
+                self.main_scroll_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+        def _on_mousewheel_anywhere(event: tk.Event[tk.Misc]) -> None:
+            if self.main_scroll_canvas is None:
+                return
+            widget = getattr(event, "widget", None)
+            try:
+                if widget is None or widget.winfo_toplevel() != self.root:
+                    return
+            except Exception:
+                return
+            delta = int(getattr(event, "delta", 0))
+            if delta != 0:
+                self.main_scroll_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+
+        def _on_mousewheel_linux(event: tk.Event[tk.Misc]) -> None:
+            if self.main_scroll_canvas is None:
+                return
+            widget = getattr(event, "widget", None)
+            try:
+                if widget is None or widget.winfo_toplevel() != self.root:
+                    return
+            except Exception:
+                return
+            direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
+            self.main_scroll_canvas.yview_scroll(direction, "units")
+
+        content.bind("<Configure>", _sync_scroll_region)
+        canvas.bind("<Configure>", _fit_content_width)
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        self.root.bind_all("<MouseWheel>", _on_mousewheel_anywhere, add="+")
+        self.root.bind_all("<Button-4>", _on_mousewheel_linux, add="+")
+        self.root.bind_all("<Button-5>", _on_mousewheel_linux, add="+")
+
+        top = ttk.Frame(content, padding=14)
         top.grid(row=0, column=0, sticky="nsew")
         top.columnconfigure(1, weight=1)
 
@@ -161,16 +284,19 @@ class VideoSorterGUI:
             row=1, column=2, padx=(10, 0), pady=(0, 8)
         )
 
-        runtime_bar = ttk.Frame(self.root, padding=(14, 0, 14, 10))
+        runtime_bar = ttk.Frame(content, padding=(14, 0, 14, 10))
         runtime_bar.grid(row=1, column=0, sticky="ew")
         runtime_bar.columnconfigure(0, weight=1)
 
         ttk.Label(runtime_bar, textvariable=self.runtime_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(runtime_bar, textvariable=self.face_engine_status_var, foreground=DARK_MUTED).grid(
+            row=1, column=0, sticky="w", pady=(4, 0)
+        )
         ttk.Button(runtime_bar, text="Refresh Runtime", command=self._refresh_runtime_status).grid(
-            row=0, column=1, padx=(10, 0)
+            row=0, column=1, rowspan=2, padx=(10, 0)
         )
 
-        options = ttk.LabelFrame(self.root, text="Options", padding=14)
+        options = ttk.LabelFrame(content, text="Options", padding=14)
         options.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 10))
         for idx in range(4):
             options.columnconfigure(idx, weight=1)
@@ -192,6 +318,12 @@ class VideoSorterGUI:
             textvariable=self.live_trace_button_var,
             command=self._toggle_live_trace,
         ).grid(row=1, column=2, columnspan=2, sticky="ew", pady=(0, 10))
+
+        ttk.Button(
+            options,
+            textvariable=self.face_engine_button_var,
+            command=self._toggle_face_engine,
+        ).grid(row=2, column=2, columnspan=2, sticky="ew", pady=(0, 10))
 
         ttk.Button(
             options,
@@ -243,12 +375,25 @@ class VideoSorterGUI:
             foreground="#444444",
         ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
-        log_frame = ttk.LabelFrame(self.root, text="Logs", padding=10)
+        log_frame = ttk.LabelFrame(content, text="Logs", padding=10)
         log_frame.grid(row=3, column=0, sticky="nsew", padx=14, pady=(0, 10))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
 
-        self.log_text = tk.Text(log_frame, wrap="word", height=20, state="disabled")
+        self.log_text = tk.Text(
+            log_frame,
+            wrap="word",
+            height=8,
+            state="disabled",
+            bg="#0f1318",
+            fg=DARK_TEXT,
+            insertbackground=DARK_TEXT,
+            selectbackground="#2f6feb",
+            selectforeground="#ffffff",
+            highlightthickness=0,
+            relief="flat",
+            borderwidth=0,
+        )
         self.log_text.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -256,7 +401,7 @@ class VideoSorterGUI:
         ttk.Label(log_frame, textvariable=self.live_status_var).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(log_frame, textvariable=self.progress_status_var).grid(row=2, column=0, sticky="w", pady=(4, 0))
 
-        results_frame = ttk.LabelFrame(self.root, text="Results This Run", padding=10)
+        results_frame = ttk.LabelFrame(content, text="Results This Run", padding=10)
         results_frame.grid(row=4, column=0, sticky="nsew", padx=14, pady=(0, 10))
         results_frame.columnconfigure(0, weight=1)
         results_frame.rowconfigure(0, weight=1)
@@ -265,7 +410,7 @@ class VideoSorterGUI:
             results_frame,
             columns=("video", "decision", "confidence", "why", "tags"),
             show="headings",
-            height=7,
+            height=6,
         )
         self.results_tree.heading("video", text="Video")
         self.results_tree.heading("decision", text="Decision")
@@ -283,7 +428,7 @@ class VideoSorterGUI:
         result_scroll.grid(row=0, column=1, sticky="ns")
         self.results_tree.configure(yscrollcommand=result_scroll.set)
 
-        footer = ttk.Frame(self.root, padding=(14, 0, 14, 14))
+        footer = ttk.Frame(content, padding=(14, 0, 14, 14))
         footer.grid(row=5, column=0, sticky="ew")
         footer.columnconfigure(1, weight=1)
         footer.columnconfigure(2, weight=1)
@@ -343,6 +488,10 @@ class VideoSorterGUI:
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", text)
+        total_lines = int(float(self.log_text.index("end-1c").split(".")[0]))
+        trim_lines = compute_log_trim_lines(total_lines, LOG_MAX_LINES)
+        if trim_lines > 0:
+            self.log_text.delete("1.0", f"{trim_lines + 1}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
@@ -375,6 +524,19 @@ class VideoSorterGUI:
         else:
             self.learning_button_var.set("Learning: Off")
 
+    def _update_face_engine_button_text(self) -> None:
+        if self.use_insightface_var.get():
+            self.face_engine_button_var.set("Face Engine: InsightFace")
+        else:
+            self.face_engine_button_var.set("Face Engine: FaceNet (Legacy)")
+
+    def _update_face_engine_status_text(self, active_engine: str = "") -> None:
+        selected = "InsightFace" if self.use_insightface_var.get() else "FaceNet (Legacy)"
+        if active_engine:
+            self.face_engine_status_var.set(f"Face Engine: {active_engine} | Selected: {selected}")
+        else:
+            self.face_engine_status_var.set(f"Face Engine: selected {selected}")
+
     def _update_live_trace_button_text(self) -> None:
         if self.live_trace_var.get():
             self.live_trace_button_var.set("Live Preview: On")
@@ -396,6 +558,12 @@ class VideoSorterGUI:
         self._update_learning_button_text()
         self._save_settings()
 
+    def _toggle_face_engine(self) -> None:
+        self.use_insightface_var.set(not self.use_insightface_var.get())
+        self._update_face_engine_button_text()
+        self._update_face_engine_status_text()
+        self._save_settings()
+
     def _toggle_live_trace(self) -> None:
         self.live_trace_var.set(not self.live_trace_var.get())
         self._update_live_trace_button_text()
@@ -406,28 +574,14 @@ class VideoSorterGUI:
 
     def _apply_selected_profile_to_fields(self) -> None:
         selected = self.profile_var.get().strip()
+        defaults = resolve_profile_defaults(selected)
         if selected not in PROFILE_TO_BACKEND:
             self.profile_var.set("Balanced")
-            selected = "Balanced"
-
-        if selected == "Fast":
-            self.max_seconds_var.set("40")
-            self.sample_every_var.set("2.5")
-            self.stabilization_var.set("6.0")
-            self.resize_width_var.set("720")
-            self.max_workers_var.set("2")
-        elif selected == "High Accuracy":
-            self.max_seconds_var.set("90")
-            self.sample_every_var.set("1.0")
-            self.stabilization_var.set("10.0")
-            self.resize_width_var.set("1152")
-            self.max_workers_var.set("1")
-        else:
-            self.max_seconds_var.set("60")
-            self.sample_every_var.set("2.0")
-            self.stabilization_var.set("8.0")
-            self.resize_width_var.set("960")
-            self.max_workers_var.set("1")
+        self.max_seconds_var.set(defaults["max_seconds"])
+        self.sample_every_var.set(defaults["sample_every_sec"])
+        self.stabilization_var.set(defaults["stabilization_seconds"])
+        self.resize_width_var.set(defaults["resize_width"])
+        self.max_workers_var.set(defaults["max_workers"])
         self._save_settings()
 
     def _load_settings(self) -> None:
@@ -444,16 +598,19 @@ class VideoSorterGUI:
         self.include_generated_var.set(bool(data.get("include_generated_folders", False)))
         self.review_mode_var.set(bool(data.get("review_mode", False)))
         self.learning_enabled_var.set(bool(data.get("learning_enabled", True)))
+        self.use_insightface_var.set(bool(data.get("use_insightface", True)))
         self.live_trace_var.set(bool(data.get("live_trace", False)))
         self._update_include_generated_button_text()
         self._update_review_mode_button_text()
         self._update_learning_button_text()
+        self._update_face_engine_button_text()
+        self._update_face_engine_status_text()
         self._update_live_trace_button_text()
         self.max_seconds_var.set(str(data.get("max_seconds", "60")))
         self.sample_every_var.set(str(data.get("sample_every_sec", "2.0")))
         self.stabilization_var.set(str(data.get("stabilization_seconds", "8.0")))
         self.resize_width_var.set(str(data.get("resize_width", "960")))
-        self.max_workers_var.set(str(data.get("max_workers", "1")))
+        self.max_workers_var.set(str(data.get("max_workers", "2")))
         profile_backend = str(data.get("profile", "balanced")).strip().lower().replace("-", "_")
         self.profile_var.set(BACKEND_TO_PROFILE.get(profile_backend, "Balanced"))
 
@@ -465,6 +622,7 @@ class VideoSorterGUI:
             "include_generated_folders": self.include_generated_var.get(),
             "review_mode": self.review_mode_var.get(),
             "learning_enabled": self.learning_enabled_var.get(),
+            "use_insightface": self.use_insightface_var.get(),
             "live_trace": self.live_trace_var.get(),
             "max_seconds": self.max_seconds_var.get().strip(),
             "sample_every_sec": self.sample_every_var.get().strip(),
@@ -481,6 +639,7 @@ class VideoSorterGUI:
     def _refresh_runtime_status(self) -> None:
         if not BACKEND_SCRIPT.exists():
             self.runtime_var.set("Runtime: backend script not found")
+            self._update_face_engine_status_text()
             return
 
         try:
@@ -497,6 +656,8 @@ class VideoSorterGUI:
                 command,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 cwd=str(BACKEND_SCRIPT.parent),
                 check=True,
             )
@@ -509,12 +670,15 @@ class VideoSorterGUI:
                 self.runtime_var.set(f"Runtime: {acceleration} | {device_text}")
             else:
                 self.runtime_var.set(f"Runtime: {acceleration} | {reason}")
+            selected_engine = "InsightFace" if self.use_insightface_var.get() else "FaceNet (Legacy)"
+            self._update_face_engine_status_text(selected_engine)
         except Exception as exc:
             if isinstance(exc, subprocess.CalledProcessError):
                 detail = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()[-1]
                 self.runtime_var.set(f"Runtime: check failed | {detail}")
             else:
                 self.runtime_var.set(f"Runtime: check failed ({exc})")
+            self._update_face_engine_status_text()
 
     def _parse_numeric_options(self) -> tuple[int, float, float, int, int] | None:
         try:
@@ -569,6 +733,10 @@ class VideoSorterGUI:
         ]
         if not self.learning_enabled_var.get():
             command.append("--no-learning-enabled")
+        if self.use_insightface_var.get():
+            command.append("--use-insightface")
+        else:
+            command.append("--no-use-insightface")
         if self.live_trace_var.get():
             command.append("--live-trace")
         return command
@@ -640,6 +808,8 @@ class VideoSorterGUI:
             max_workers=max_workers,
         )
         command.append("--reprocess-uncertain-only")
+        if self.review_mode_var.get():
+            command.append("--review-mode")
         return command
 
     def _clear_stop_flag(self) -> None:
@@ -664,12 +834,18 @@ class VideoSorterGUI:
             str(destination),
             *extra_args,
         ]
+        if self.use_insightface_var.get():
+            command.append("--use-insightface")
+        else:
+            command.append("--no-use-insightface")
         if not self.learning_enabled_var.get():
             command.append("--no-learning-enabled")
         completed = subprocess.run(
             command,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=str(BACKEND_SCRIPT.parent),
             check=False,
         )
@@ -1176,6 +1352,16 @@ class VideoSorterGUI:
 
         details = payload.get("details", {})
         self._append_log(f"[IDENTITY] {action_name} -> {details}\n")
+        if isinstance(details, dict):
+            learning_events = int(details.get("learning_feedback_events", 0) or 0)
+            learning_with_embeddings = int(details.get("learning_feedback_with_embeddings", 0) or 0)
+            cache_file = str(details.get("embedding_cache_file", "")).strip()
+            if learning_events > 0 or learning_with_embeddings > 0 or cache_file:
+                self._append_log(
+                    "[LEARNING] "
+                    f"events={learning_events} with_embeddings={learning_with_embeddings} "
+                    f"cache={cache_file}\n"
+                )
         self._refresh_identity_tools()
         self._refresh_learning_stats()
         self._refresh_review_queue_status()
@@ -1686,6 +1872,7 @@ class VideoSorterGUI:
         self._append_log(f"$ {' '.join(command)}\n\n")
         self.status_var.set(status_text)
         self.live_status_var.set("Live: starting...")
+        self._update_face_engine_status_text("starting...")
         self.progress_status_var.set("Progress: 0/0 videos")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal", text="Stop (Save Progress)")
@@ -1701,6 +1888,8 @@ class VideoSorterGUI:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
             cwd=str(BACKEND_SCRIPT.parent),
         )
@@ -1717,6 +1906,7 @@ class VideoSorterGUI:
         self.log_queue.put("__PROCESS_DONE__")
 
     def _poll_log_queue(self) -> None:
+        log_chunks: list[str] = []
         while True:
             try:
                 item = self.log_queue.get_nowait()
@@ -1743,6 +1933,12 @@ class VideoSorterGUI:
                     continue
                 if item.startswith("[TRACE] "):
                     self.live_status_var.set(item.replace("[TRACE] ", "Live: ").strip())
+                if "[INFO] InsightFace initialized:" in item:
+                    self._update_face_engine_status_text("InsightFace")
+                elif "[INFO] FaceNet initialized:" in item:
+                    self._update_face_engine_status_text("FaceNet (Fallback)")
+                elif "InsightFace runtime failed, switching to FaceNet fallback" in item:
+                    self._update_face_engine_status_text("FaceNet (Fallback)")
                 if item.startswith("[PROGRESS] "):
                     payload = item[len("[PROGRESS] ") :].strip().split()
                     values: dict[str, int] = {}
@@ -1763,7 +1959,10 @@ class VideoSorterGUI:
                     self.progress_status_var.set(
                         f"Progress: {done}/{total} videos | female={female} | no_female={no_female} | errors={errors}"
                     )
-                self._append_log(item)
+                log_chunks.append(item)
+
+        if log_chunks:
+            self._append_log(combine_log_chunks(log_chunks))
 
         self._update_reprocess_button_state()
         self.root.after(100, self._poll_log_queue)
@@ -1807,7 +2006,93 @@ class VideoSorterGUI:
 
 def main() -> int:
     root = tk.Tk()
-    ttk.Style(root).theme_use("clam")
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    root.configure(bg=DARK_BG)
+
+    style.configure(
+        ".",
+        background=DARK_BG,
+        foreground=DARK_TEXT,
+        fieldbackground=DARK_SURFACE,
+        bordercolor=DARK_BORDER,
+        lightcolor=DARK_BORDER,
+        darkcolor=DARK_BORDER,
+        troughcolor=DARK_SURFACE,
+        focuscolor=DARK_ACCENT,
+    )
+    style.map(".", foreground=[("disabled", DARK_MUTED)])
+
+    style.configure("TFrame", background=DARK_BG)
+    style.configure("TLabelframe", background=DARK_BG, foreground=DARK_TEXT, bordercolor=DARK_BORDER)
+    style.configure("TLabelframe.Label", background=DARK_BG, foreground=DARK_TEXT)
+    style.configure("TLabel", background=DARK_BG, foreground=DARK_TEXT)
+    style.configure("TCheckbutton", background=DARK_BG, foreground=DARK_TEXT)
+
+    style.configure(
+        "TButton",
+        background=DARK_SURFACE,
+        foreground=DARK_TEXT,
+        bordercolor=DARK_BORDER,
+        focusthickness=1,
+        focuscolor=DARK_ACCENT,
+        padding=(8, 6),
+    )
+    style.map(
+        "TButton",
+        background=[("active", DARK_ACCENT_ACTIVE), ("pressed", DARK_ACCENT)],
+        foreground=[("disabled", DARK_MUTED)],
+    )
+
+    style.configure(
+        "TEntry",
+        fieldbackground="#11161d",
+        foreground=DARK_TEXT,
+        bordercolor=DARK_BORDER,
+        insertcolor=DARK_TEXT,
+    )
+    style.configure(
+        "TCombobox",
+        fieldbackground="#11161d",
+        background=DARK_SURFACE,
+        foreground=DARK_TEXT,
+        arrowcolor=DARK_TEXT,
+        bordercolor=DARK_BORDER,
+    )
+
+    style.configure(
+        "Vertical.TScrollbar",
+        background=DARK_SURFACE,
+        troughcolor="#11161d",
+        bordercolor=DARK_BORDER,
+        arrowcolor=DARK_TEXT,
+    )
+    style.configure(
+        "Horizontal.TScrollbar",
+        background=DARK_SURFACE,
+        troughcolor="#11161d",
+        bordercolor=DARK_BORDER,
+        arrowcolor=DARK_TEXT,
+    )
+
+    style.configure("TProgressbar", background=DARK_ACCENT, troughcolor="#11161d", bordercolor=DARK_BORDER)
+    style.configure("Treeview", rowheight=24, background="#11161d", foreground=DARK_TEXT, fieldbackground="#11161d")
+    style.map("Treeview", background=[("selected", DARK_ACCENT)], foreground=[("selected", "#ffffff")])
+    style.configure(
+        "Treeview.Heading",
+        background=DARK_SURFACE,
+        foreground=DARK_TEXT,
+        bordercolor=DARK_BORDER,
+        padding=(8, 4),
+    )
+    style.map("Treeview.Heading", background=[("active", DARK_ACCENT_ACTIVE)])
+
+    root.option_add("*Text.Background", "#0f1318")
+    root.option_add("*Text.Foreground", DARK_TEXT)
+    root.option_add("*Listbox.Background", "#11161d")
+    root.option_add("*Listbox.Foreground", DARK_TEXT)
+    root.option_add("*Menu.Background", DARK_SURFACE)
+    root.option_add("*Menu.Foreground", DARK_TEXT)
     VideoSorterGUI(root)
     root.mainloop()
     return 0

@@ -2,11 +2,15 @@ import argparse
 import unittest
 
 from sort_videos_by_female_faces_gpu import (
+    Config,
     PROFILE_BALANCED,
     PROFILE_HIGH_ACCURACY,
+    apply_insightface_defaults,
     apply_profile_defaults,
     apply_uncertain_reprocess_defaults,
+    memory_file_path,
     normalize_profile_name,
+    sorting_embedding_cache_filename,
 )
 
 
@@ -103,6 +107,52 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(args.female_confirmation_frames, 2)
         self.assertEqual(args.min_female_vote_ratio, 0.62)
         self.assertEqual(args.min_stable_embeddings, 5)
+
+    def test_insightface_defaults_apply_when_enabled(self) -> None:
+        args = argparse.Namespace(
+            use_insightface=True,
+            detection_confidence=0.90,
+            same_person_threshold=0.72,
+            duplicate_threshold=0.985,
+            dbscan_eps=0.35,
+            cluster_merge_threshold=0.78,
+        )
+        apply_insightface_defaults(args)
+        self.assertEqual(args.detection_confidence, 0.60)
+        self.assertEqual(args.same_person_threshold, 0.45)
+        self.assertEqual(args.duplicate_threshold, 0.95)
+        self.assertEqual(args.dbscan_eps, 0.40)
+        self.assertEqual(args.cluster_merge_threshold, 0.68)
+
+    def test_insightface_defaults_respect_manual_flags(self) -> None:
+        args = argparse.Namespace(
+            use_insightface=True,
+            detection_confidence=0.75,
+            same_person_threshold=0.80,
+            duplicate_threshold=0.99,
+            dbscan_eps=0.20,
+            cluster_merge_threshold=0.90,
+        )
+        apply_insightface_defaults(
+            args,
+            ["--detection-confidence", "--same-person-threshold", "--dbscan-eps"],
+        )
+        self.assertEqual(args.detection_confidence, 0.75)
+        self.assertEqual(args.same_person_threshold, 0.80)
+        self.assertEqual(args.dbscan_eps, 0.20)
+        self.assertEqual(args.duplicate_threshold, 0.95)
+        self.assertEqual(args.cluster_merge_threshold, 0.68)
+
+    def test_model_specific_memory_files_are_separated(self) -> None:
+        insight_cfg = Config(input_dir=".", output_dir=".", use_insightface=True)
+        facenet_cfg = Config(input_dir=".", output_dir=".", use_insightface=False)
+        self.assertNotEqual(memory_file_path(insight_cfg).name, memory_file_path(facenet_cfg).name)
+        self.assertEqual(memory_file_path(insight_cfg).name, "memory_insightface_v1.json")
+        self.assertEqual(memory_file_path(facenet_cfg).name, "memory_facenet_v1.json")
+
+    def test_model_specific_embedding_cache_files_are_separated(self) -> None:
+        self.assertEqual(sorting_embedding_cache_filename(True), "video_embedding_cache_insightface.json")
+        self.assertEqual(sorting_embedding_cache_filename(False), "video_embedding_cache_facenet.json")
 
 
 if __name__ == "__main__":
