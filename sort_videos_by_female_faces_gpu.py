@@ -31,12 +31,15 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import multiprocessing as mp
 import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 import urllib.request
 import uuid
@@ -55,8 +58,17 @@ from PIL import Image
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm
 
+from duplicate_tools import apply_duplicate_move, scan_duplicates
 from folder_naming import build_cluster_folder_names, sanitize_folder_name
-from learning_memory import default_memory_path, load_memory, match_identity, record_feedback, save_memory
+from identity_tools import list_identities, perform_identity_action
+from learning_memory import (
+    build_learning_summary,
+    default_memory_path,
+    load_memory,
+    match_identity,
+    record_feedback,
+    save_memory,
+)
 from review_queue import (
     REVIEW_PENDING_DIRNAME,
     REVIEW_STATE_DIRNAME,
@@ -86,7 +98,9 @@ GENDER_MEAN = (78.4263377603, 87.7689143744, 114.895847746)
 class Config:
     input_dir: str
     output_dir: str
+    profile: str = "balanced"
     review_mode: bool = False
+    reprocess_uncertain_only: bool = False
     learning_enabled: bool = True
     learning_memory_file: str = ""
     learning_auto_threshold: float = 0.82
@@ -130,13 +144,127 @@ MTCNN_MODEL: Optional[MTCNN] = None
 EMBED_MODEL: Optional[InceptionResnetV1] = None
 GENDER_NET: Optional[cv2.dnn_Net] = None
 ACTIVE_ACCELERATION = "CPU fallback"
-PREVIEW_ENABLED = True
+PREVIEW_ENABLED = False
 PREVIEW_WARNED = False
 PREVIEW_WINDOW_TITLE = "Live Frame Preview"
+RESULT_JSON_PREFIX = "[RESULT_JSON] "
+REPORTS_DIRNAME = ".reports"
+UNCERTAIN_DIRNAME = "Uncertain"
+REASON_TAG_PRIORITY = [
+    "memory_match_applied",
+    "gender_disagreement",
+    "few_stable_embeddings",
+    "few_votes",
+    "low_face_area",
+    "unverified_female_candidates",
+    "memory_match_suggested",
+]
+PROFILE_FAST = "fast"
+PROFILE_BALANCED = "balanced"
+PROFILE_HIGH_ACCURACY = "high_accuracy"
+PROFILE_KEY_TO_FLAG = {
+    "max_seconds": "--max-seconds",
+    "sample_every_sec": "--sample-every-sec",
+    "stabilization_seconds": "--stabilization-seconds",
+    "resize_width": "--resize-width",
+    "detection_batch_size": "--detection-batch-size",
+    "female_confirmation_frames": "--female-confirmation-frames",
+    "min_female_vote_ratio": "--min-female-vote-ratio",
+    "min_stable_embeddings": "--min-stable-embeddings",
+    "min_stabilization_gender_votes": "--min-stabilization-gender-votes",
+    "same_person_threshold": "--same-person-threshold",
+    "cluster_merge_threshold": "--cluster-merge-threshold",
+}
+PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
+    PROFILE_FAST: {
+        "max_seconds": 40,
+        "sample_every_sec": 2.5,
+        "stabilization_seconds": 6.0,
+        "resize_width": 720,
+        "detection_batch_size": 6,
+        "female_confirmation_frames": 1,
+        "min_female_vote_ratio": 0.58,
+        "min_stable_embeddings": 2,
+        "min_stabilization_gender_votes": 2,
+        "same_person_threshold": 0.70,
+        "cluster_merge_threshold": 0.76,
+    },
+    PROFILE_BALANCED: {
+        "max_seconds": 60,
+        "sample_every_sec": 2.0,
+        "stabilization_seconds": 8.0,
+        "resize_width": 960,
+        "detection_batch_size": 4,
+        "female_confirmation_frames": 2,
+        "min_female_vote_ratio": 0.62,
+        "min_stable_embeddings": 3,
+        "min_stabilization_gender_votes": 3,
+        "same_person_threshold": 0.72,
+        "cluster_merge_threshold": 0.78,
+    },
+    PROFILE_HIGH_ACCURACY: {
+        "max_seconds": 90,
+        "sample_every_sec": 1.0,
+        "stabilization_seconds": 10.0,
+        "resize_width": 1152,
+        "detection_batch_size": 3,
+        "female_confirmation_frames": 3,
+        "min_female_vote_ratio": 0.66,
+        "min_stable_embeddings": 4,
+        "min_stabilization_gender_votes": 4,
+        "same_person_threshold": 0.74,
+        "cluster_merge_threshold": 0.82,
+    },
+}
 
 
 class StopRequestedError(Exception):
     pass
+
+
+def normalize_profile_name(raw_value: str) -> str:
+    normalized = str(raw_value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {PROFILE_FAST, PROFILE_BALANCED, PROFILE_HIGH_ACCURACY}:
+        return normalized
+    return PROFILE_BALANCED
+
+
+def apply_profile_defaults(args: argparse.Namespace, cli_tokens: Optional[Sequence[str]] = None) -> str:
+    profile = normalize_profile_name(getattr(args, "profile", PROFILE_BALANCED))
+    token_set = set(cli_tokens or [])
+    for key, value in PROFILE_PRESETS.get(profile, PROFILE_PRESETS[PROFILE_BALANCED]).items():
+        flag = PROFILE_KEY_TO_FLAG.get(key, "")
+        if flag and flag in token_set:
+            continue
+        setattr(args, key, value)
+    args.profile = profile
+    return profile
+
+
+def apply_uncertain_reprocess_defaults(args: argparse.Namespace, cli_tokens: Optional[Sequence[str]] = None) -> str:
+    token_set = set(cli_tokens or [])
+    if "--profile" not in token_set:
+        args.profile = PROFILE_HIGH_ACCURACY
+        for key, value in PROFILE_PRESETS[PROFILE_HIGH_ACCURACY].items():
+            flag = PROFILE_KEY_TO_FLAG.get(key, "")
+            if flag and flag in token_set:
+                continue
+            setattr(args, key, value)
+    else:
+        args.profile = normalize_profile_name(getattr(args, "profile", PROFILE_BALANCED))
+
+    strict_defaults: Dict[str, Any] = {
+        "female_confirmation_frames": 4,
+        "min_stable_embeddings": 5,
+        "min_stabilization_gender_votes": 5,
+        "min_female_vote_ratio": 0.70,
+    }
+    for key, value in strict_defaults.items():
+        flag = PROFILE_KEY_TO_FLAG.get(key, "")
+        if flag and flag in token_set:
+            continue
+        setattr(args, key, value)
+    return normalize_profile_name(getattr(args, "profile", PROFILE_BALANCED))
 
 
 def gpu_smoke_test() -> Tuple[bool, str]:
@@ -302,7 +430,7 @@ def resolve_gender_model_paths(cfg: Config) -> Tuple[Path, Path]:
 def init_worker(cfg: Config) -> None:
     global CFG, DEVICE, MTCNN_MODEL, EMBED_MODEL, GENDER_NET, ACTIVE_ACCELERATION, PREVIEW_ENABLED
     CFG = cfg
-    PREVIEW_ENABLED = cfg.max_workers == 1
+    PREVIEW_ENABLED = bool(cfg.live_trace and cfg.max_workers == 1)
 
     proto_path, model_path = resolve_gender_model_paths(cfg)
 
@@ -357,6 +485,8 @@ def list_videos(input_dir: str, recursive: bool = True, include_generated_folder
         rel_parts = path.relative_to(root).parts
         rel_parts_set = set(rel_parts)
         if REVIEW_STATE_DIRNAME in rel_parts_set or REVIEW_PENDING_DIRNAME in rel_parts_set:
+            continue
+        if "Duplicates" in rel_parts_set or UNCERTAIN_DIRNAME in rel_parts_set:
             continue
         if not include_generated_folders:
             if ".model_cache" in rel_parts_set or "No_Female_Found" in rel_parts_set:
@@ -634,7 +764,10 @@ def close_live_preview() -> None:
         return
     try:
         cv2.destroyWindow(PREVIEW_WINDOW_TITLE)
-        cv2.waitKey(1)
+    except Exception:
+        pass
+    try:
+        cv2.destroyAllWindows()
     except Exception:
         pass
 
@@ -756,6 +889,8 @@ def find_first_female(
     sample_indices = [timestamp_to_frame_index(ts, fps, total_frames) for ts in sample_times]
     female_seed_hits = 0
     best_seed_conf = 0.0
+    total_faces_evaluated = 0
+    low_face_area_rejections = 0
 
     for start in range(0, len(sample_times), cfg.detection_batch_size):
         ensure_not_stopped()
@@ -789,9 +924,11 @@ def find_first_female(
                 if checked >= cfg.max_faces_per_frame:
                     break
                 checked += 1
+                total_faces_evaluated += 1
 
                 expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
                 if face_area_ratio(expanded, frame_bgr) < cfg.min_face_area_ratio:
+                    low_face_area_rejections += 1
                     continue
                 face_bgr = crop_bgr(frame_bgr, expanded)
                 if face_bgr is None:
@@ -837,6 +974,8 @@ def find_first_female(
                     {
                         "female_seed_hits": female_seed_hits,
                         "best_seed_confidence": best_seed_conf,
+                        "total_faces_evaluated": total_faces_evaluated,
+                        "low_face_area_rejections": low_face_area_rejections,
                     },
                 )
 
@@ -849,6 +988,8 @@ def find_first_female(
         {
             "female_seed_hits": female_seed_hits,
             "best_seed_confidence": best_seed_conf,
+            "total_faces_evaluated": total_faces_evaluated,
+            "low_face_area_rejections": low_face_area_rejections,
         },
     )
 
@@ -858,6 +999,7 @@ def select_best_matching_face(
     faces: List[Dict[str, Any]],
     reference_embedding: np.ndarray,
     cfg: Config,
+    diagnostics: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int, int, int]], float]:
     candidate_boxes: List[Tuple[int, int, int, int]] = []
     candidate_crops_rgb: List[np.ndarray] = []
@@ -865,8 +1007,12 @@ def select_best_matching_face(
     for face in faces[: cfg.max_faces_per_frame]:
         if face["prob"] < cfg.detection_confidence:
             continue
+        if diagnostics is not None:
+            diagnostics["total_faces_evaluated"] = int(diagnostics.get("total_faces_evaluated", 0)) + 1
         expanded = expand_box(face["bbox"], cfg.mtcnn_margin_px, frame_bgr.shape[1], frame_bgr.shape[0])
         if face_area_ratio(expanded, frame_bgr) < cfg.min_face_area_ratio:
+            if diagnostics is not None:
+                diagnostics["low_face_area_rejections"] = int(diagnostics.get("low_face_area_rejections", 0)) + 1
             continue
         crop = crop_bgr(frame_bgr, expanded)
         if crop is None:
@@ -898,13 +1044,17 @@ def stabilize_identity(
     initial_gender_conf: float,
     cfg: Config,
     video_name: str,
-) -> Tuple[List[np.ndarray], float, float, int]:
+) -> Tuple[List[np.ndarray], float, float, int, Dict[str, int]]:
     ensure_not_stopped()
+    diagnostics: Dict[str, int] = {
+        "total_faces_evaluated": 0,
+        "low_face_area_rejections": 0,
+    }
     end_ts = min(scan_duration, first_ts + cfg.stabilization_seconds)
     if end_ts <= first_ts:
         female_score = initial_gender_conf if initial_gender_label.lower() == "female" else 0.0
         male_score = initial_gender_conf if initial_gender_label.lower() == "male" else 0.0
-        return [first_embedding], female_score, male_score, 1
+        return [first_embedding], female_score, male_score, 1, diagnostics
 
     kept_embeddings: List[np.ndarray] = [first_embedding]
     female_score = initial_gender_conf if initial_gender_label.lower() == "female" else 0.0
@@ -948,6 +1098,7 @@ def stabilize_identity(
                 faces=faces,
                 reference_embedding=running_reference,
                 cfg=cfg,
+                diagnostics=diagnostics,
             )
             if matched_embedding is None or matched_box is None:
                 continue
@@ -978,7 +1129,7 @@ def stabilize_identity(
             running_reference = np.mean(np.vstack(kept_embeddings), axis=0).astype(np.float32)
             running_reference /= np.linalg.norm(running_reference) + 1e-8
 
-    return kept_embeddings, female_score, male_score, gender_votes
+    return kept_embeddings, female_score, male_score, gender_votes, diagnostics
 
 
 def clamp_confidence(value: float) -> float:
@@ -989,6 +1140,392 @@ def set_decision(result: Dict[str, Any], label: str, reason: str, confidence: fl
     result["decision_label"] = label
     result["decision_reason"] = reason
     result["confidence_score"] = round(clamp_confidence(confidence), 3)
+
+
+def empty_reason_metrics() -> Dict[str, Any]:
+    return {
+        "total_faces_evaluated": 0,
+        "low_face_area_rejections": 0,
+        "stable_embeddings": 0,
+        "gender_votes": 0,
+        "female_score": 0.0,
+        "male_score": 0.0,
+        "female_seed_hits": 0,
+        "best_seed_confidence": 0.0,
+    }
+
+
+def new_result_record(video_path: str, device_label: str) -> Dict[str, Any]:
+    return {
+        "video": video_path,
+        "female_found": False,
+        "embedding": None,
+        "error": None,
+        "stopped": False,
+        "samples_used": 0,
+        "device": device_label,
+        "decision_label": "unknown",
+        "decision_reason": "",
+        "confidence_score": 0.0,
+        "suggested_cluster_id": None,
+        "suggested_folder_name": "",
+        "memory_match_label": "",
+        "memory_match_score": 0.0,
+        "memory_applied": False,
+        "learning_applied": False,
+        "adaptive_threshold_used": 0.0,
+        "feedback_consistency_snapshot": {},
+        "memory_suggestion": "",
+        "reason_summary": "",
+        "reason_tags": [],
+        "reason_metrics": empty_reason_metrics(),
+    }
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _normalize_reason_metrics(metrics: Any) -> Dict[str, Any]:
+    if not isinstance(metrics, dict):
+        metrics = {}
+    normalized = empty_reason_metrics()
+    normalized["total_faces_evaluated"] = max(0, _safe_int(metrics.get("total_faces_evaluated", 0)))
+    normalized["low_face_area_rejections"] = max(0, _safe_int(metrics.get("low_face_area_rejections", 0)))
+    normalized["stable_embeddings"] = max(0, _safe_int(metrics.get("stable_embeddings", 0)))
+    normalized["gender_votes"] = max(0, _safe_int(metrics.get("gender_votes", 0)))
+    normalized["female_seed_hits"] = max(0, _safe_int(metrics.get("female_seed_hits", 0)))
+    normalized["female_score"] = round(max(0.0, _safe_float(metrics.get("female_score", 0.0))), 4)
+    normalized["male_score"] = round(max(0.0, _safe_float(metrics.get("male_score", 0.0))), 4)
+    normalized["best_seed_confidence"] = round(
+        clamp_confidence(_safe_float(metrics.get("best_seed_confidence", 0.0))),
+        4,
+    )
+    return normalized
+
+
+def _fallback_reason_summary(decision_label: str, decision_reason: str) -> str:
+    decision_reason = decision_reason.strip()
+    if decision_reason:
+        return decision_reason
+    label = decision_label.strip().lower()
+    if label == "female_detected":
+        return "Consistent female detection."
+    if label == "no_female":
+        return "No female evidence detected."
+    if label == "uncertain":
+        return "Uncertain due to weak or conflicting evidence."
+    if label == "error":
+        return "Processing error."
+    if label == "stopped":
+        return "Stopped before completion."
+    return "No explanation available."
+
+
+def apply_explainability_metadata(result: Dict[str, Any], cfg: Config) -> None:
+    metrics = _normalize_reason_metrics(result.get("reason_metrics"))
+    result["reason_metrics"] = metrics
+
+    decision_label = str(result.get("decision_label", "")).strip().lower()
+    decision_reason = str(result.get("decision_reason", ""))
+    reason_lower = decision_reason.lower()
+
+    tags: List[str] = []
+
+    total_faces = int(metrics.get("total_faces_evaluated", 0))
+    low_area_rejections = int(metrics.get("low_face_area_rejections", 0))
+    stable_embeddings = int(metrics.get("stable_embeddings", 0))
+    gender_votes = int(metrics.get("gender_votes", 0))
+    female_score = float(metrics.get("female_score", 0.0))
+    male_score = float(metrics.get("male_score", 0.0))
+    seed_hits = int(metrics.get("female_seed_hits", 0))
+
+    if total_faces > 0 and low_area_rejections > 0 and (low_area_rejections / max(1, total_faces)) >= 0.5:
+        tags.append("low_face_area")
+
+    if (
+        stable_embeddings > 0 and stable_embeddings < cfg.min_stable_embeddings
+    ) or ("stable embeddings" in reason_lower) or ("identity could not be stabilized" in reason_lower):
+        tags.append("few_stable_embeddings")
+
+    if (gender_votes > 0 and gender_votes < cfg.min_stabilization_gender_votes) or (
+        "only" in reason_lower and "gender votes" in reason_lower
+    ):
+        tags.append("few_votes")
+
+    if (female_score > 0 and male_score > 0 and female_score <= male_score) or ("conflicting gender votes" in reason_lower):
+        tags.append("gender_disagreement")
+
+    if seed_hits > 0 and decision_label in {"uncertain", "no_female"} and "none verified" in reason_lower:
+        tags.append("unverified_female_candidates")
+
+    if bool(result.get("memory_applied", False)):
+        tags.append("memory_match_applied")
+    elif str(result.get("memory_match_label", "")).strip() and decision_label == "uncertain":
+        tags.append("memory_match_suggested")
+
+    # Keep deterministic order even when multiple conditions match.
+    tag_set = set(tags)
+    ordered_tags = [tag for tag in REASON_TAG_PRIORITY if tag in tag_set]
+    result["reason_tags"] = ordered_tags
+
+    summary_by_tag = {
+        "memory_match_applied": "High-confidence memory match auto-applied.",
+        "gender_disagreement": "Gender evidence disagreed during stabilization.",
+        "few_stable_embeddings": "Too few stable identity samples were collected.",
+        "few_votes": "Too few gender votes were collected.",
+        "low_face_area": "Most candidate faces were too small for reliable evidence.",
+        "unverified_female_candidates": "Female-like candidates appeared but were not verified.",
+        "memory_match_suggested": "Memory suggests a match, but confidence is below auto-apply threshold.",
+    }
+    if ordered_tags:
+        result["reason_summary"] = summary_by_tag.get(ordered_tags[0], _fallback_reason_summary(decision_label, decision_reason))
+    else:
+        result["reason_summary"] = _fallback_reason_summary(decision_label, decision_reason)
+
+
+def build_result_json_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    video_path = str(result.get("video", ""))
+    reason_tags = result.get("reason_tags", [])
+    if not isinstance(reason_tags, list):
+        reason_tags = []
+    payload = {
+        "video": video_path,
+        "video_name": Path(video_path).name if video_path else "",
+        "decision_label": str(result.get("decision_label", "")),
+        "confidence_score": round(clamp_confidence(_safe_float(result.get("confidence_score", 0.0))), 3),
+        "reason_summary": str(result.get("reason_summary", "")),
+        "reason_tags": [str(tag) for tag in reason_tags],
+        "reason_metrics": _normalize_reason_metrics(result.get("reason_metrics")),
+        "decision_reason": str(result.get("decision_reason", "")),
+        "memory_match_label": str(result.get("memory_match_label", "")),
+        "memory_match_score": round(_safe_float(result.get("memory_match_score", 0.0)), 4),
+        "memory_applied": bool(result.get("memory_applied", False)),
+        "learning_applied": bool(result.get("learning_applied", result.get("memory_applied", False))),
+        "adaptive_threshold_used": round(_safe_float(result.get("adaptive_threshold_used", 0.0)), 4),
+        "feedback_consistency_snapshot": result.get("feedback_consistency_snapshot", {}),
+        "stopped": bool(result.get("stopped", False)),
+        "error": str(result.get("error") or ""),
+    }
+    return payload
+
+
+def emit_result_json(result: Dict[str, Any]) -> None:
+    payload = build_result_json_payload(result)
+    print(f"{RESULT_JSON_PREFIX}{json.dumps(payload, separators=(',', ':'), ensure_ascii=True)}", flush=True)
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    ensure_dir(path.parent)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def report_output_dir(output_dir: Path) -> Path:
+    return output_dir / REPORTS_DIRNAME
+
+
+def create_report_run_id(now_utc: datetime) -> str:
+    return f"{now_utc.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+
+
+def build_per_video_report_rows(results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for item in results:
+        video_path = str(item.get("video", "")).strip()
+        decision_label = str(item.get("decision_label", "")).strip().lower()
+        rows.append(
+            {
+                "video_path": video_path,
+                "video_name": Path(video_path).name if video_path else "",
+                "decision_label": decision_label,
+                "confidence_score": round(clamp_confidence(_safe_float(item.get("confidence_score", 0.0))), 3),
+                "reason_summary": str(item.get("reason_summary", "")).strip(),
+                "error": str(item.get("error") or "").strip(),
+                "memory_applied": bool(item.get("memory_applied", False)),
+                "final_destination": str(item.get("final_destination", "")).strip(),
+            }
+        )
+    return rows
+
+
+def build_run_summary_payload(
+    *,
+    run_id: str,
+    run_started_at: datetime,
+    run_finished_at: datetime,
+    total_scanned: int,
+    processed_successfully: int,
+    female_detected: int,
+    uncertain: int,
+    no_female_found: int,
+    errors: int,
+    stopped_early: bool,
+) -> Dict[str, Any]:
+    time_taken_seconds = max(0.0, (run_finished_at - run_started_at).total_seconds())
+    return {
+        "run_id": run_id,
+        "run_started_at": run_started_at.replace(microsecond=0).isoformat(),
+        "run_finished_at": run_finished_at.replace(microsecond=0).isoformat(),
+        "time_taken_seconds": round(time_taken_seconds, 3),
+        "total_scanned": int(total_scanned),
+        "processed_successfully": int(processed_successfully),
+        "female_detected": int(female_detected),
+        "uncertain": int(uncertain),
+        "no_female_found": int(no_female_found),
+        "errors": int(errors),
+        "stopped_early": bool(stopped_early),
+    }
+
+
+def derive_decision_counts(results: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    female_detected = 0
+    uncertain = 0
+    no_female_found = 0
+    errors = 0
+    processed_successfully = 0
+    for item in results:
+        has_error = bool(item.get("error"))
+        stopped = bool(item.get("stopped"))
+        decision = str(item.get("decision_label", "")).strip().lower()
+        if has_error or decision == "error":
+            errors += 1
+            continue
+        if stopped or decision == "stopped":
+            continue
+        processed_successfully += 1
+        if decision == "female_detected":
+            female_detected += 1
+        elif decision == "uncertain":
+            uncertain += 1
+        elif decision == "no_female":
+            no_female_found += 1
+    return {
+        "processed_successfully": processed_successfully,
+        "female_detected": female_detected,
+        "uncertain": uncertain,
+        "no_female_found": no_female_found,
+        "errors": errors,
+    }
+
+
+def write_run_reports(
+    *,
+    output_dir: Path,
+    run_id: str,
+    summary_payload: Dict[str, Any],
+    video_rows: Sequence[Dict[str, Any]],
+) -> Dict[str, str]:
+    reports_dir = report_output_dir(output_dir)
+    ensure_dir(reports_dir)
+
+    summary_json_path = reports_dir / f"run_{run_id}_summary.json"
+    summary_csv_path = reports_dir / f"run_{run_id}_summary.csv"
+    videos_json_path = reports_dir / f"run_{run_id}_videos.json"
+    videos_csv_path = reports_dir / f"run_{run_id}_videos.csv"
+
+    _atomic_write_text(summary_json_path, json.dumps(summary_payload, indent=2, ensure_ascii=False) + "\n")
+    _atomic_write_text(videos_json_path, json.dumps(list(video_rows), indent=2, ensure_ascii=False) + "\n")
+
+    summary_headers = [
+        "run_id",
+        "run_started_at",
+        "run_finished_at",
+        "time_taken_seconds",
+        "total_scanned",
+        "processed_successfully",
+        "female_detected",
+        "uncertain",
+        "no_female_found",
+        "errors",
+        "stopped_early",
+    ]
+    videos_headers = [
+        "video_path",
+        "video_name",
+        "decision_label",
+        "confidence_score",
+        "reason_summary",
+        "error",
+        "memory_applied",
+        "final_destination",
+    ]
+
+    summary_io = io.StringIO()
+    summary_writer = csv.DictWriter(summary_io, fieldnames=summary_headers, extrasaction="ignore")
+    summary_writer.writeheader()
+    summary_writer.writerow(summary_payload)
+    _atomic_write_text(summary_csv_path, summary_io.getvalue())
+
+    videos_io = io.StringIO()
+    videos_writer = csv.DictWriter(videos_io, fieldnames=videos_headers, extrasaction="ignore")
+    videos_writer.writeheader()
+    for row in video_rows:
+        videos_writer.writerow(row)
+    _atomic_write_text(videos_csv_path, videos_io.getvalue())
+
+    return {
+        "summary_json": str(summary_json_path),
+        "summary_csv": str(summary_csv_path),
+        "videos_json": str(videos_json_path),
+        "videos_csv": str(videos_csv_path),
+    }
+
+
+def emit_run_reports(
+    *,
+    output_dir: Path,
+    run_id: str,
+    run_started_at: datetime,
+    run_finished_at: datetime,
+    total_scanned: int,
+    processed_successfully: int,
+    female_detected: int,
+    uncertain: int,
+    no_female_found: int,
+    errors: int,
+    stopped_early: bool,
+    results: Sequence[Dict[str, Any]],
+) -> Dict[str, str]:
+    summary_payload = build_run_summary_payload(
+        run_id=run_id,
+        run_started_at=run_started_at,
+        run_finished_at=run_finished_at,
+        total_scanned=total_scanned,
+        processed_successfully=processed_successfully,
+        female_detected=female_detected,
+        uncertain=uncertain,
+        no_female_found=no_female_found,
+        errors=errors,
+        stopped_early=stopped_early,
+    )
+    video_rows = build_per_video_report_rows(results)
+    report_paths = write_run_reports(
+        output_dir=output_dir,
+        run_id=run_id,
+        summary_payload=summary_payload,
+        video_rows=video_rows,
+    )
+    print(
+        "[REPORT] "
+        f"summary_json={report_paths['summary_json']} "
+        f"summary_csv={report_paths['summary_csv']} "
+        f"videos_json={report_paths['videos_json']} "
+        f"videos_csv={report_paths['videos_csv']}",
+        flush=True,
+    )
+    return report_paths
 
 
 def memory_file_path(cfg: Config) -> Path:
@@ -1002,6 +1539,9 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
     result["memory_match_label"] = ""
     result["memory_match_score"] = 0.0
     result["memory_applied"] = False
+    result["learning_applied"] = False
+    result["adaptive_threshold_used"] = round(float(cfg.learning_auto_threshold), 4)
+    result["feedback_consistency_snapshot"] = {}
     result.setdefault("memory_suggestion", "")
 
     if not cfg.learning_enabled:
@@ -1011,32 +1551,71 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
     if not isinstance(embedding, list) or not embedding:
         return
 
-    match = match_identity(memory, embedding)
+    match = match_identity(
+        memory,
+        embedding,
+        global_auto_threshold=cfg.learning_auto_threshold,
+        global_suggest_threshold=cfg.learning_suggest_threshold,
+    )
     if not match:
         return
 
     label = str(match.get("label", "")).strip()
     score = float(match.get("score", 0.0))
+    match_locked = bool(match.get("locked", False))
+    adaptive_auto_threshold = float(match.get("adaptive_auto_threshold", cfg.learning_auto_threshold))
+    adaptive_auto_threshold = max(cfg.learning_suggest_threshold, min(cfg.learning_auto_threshold, adaptive_auto_threshold))
+    consistency = float(match.get("correction_consistency_score", 0.0))
+    positive_count = int(match.get("positive_feedback_count", 0) or 0)
+    negative_count = int(match.get("negative_feedback_count", 0) or 0)
     if not label:
         return
 
     result["memory_match_label"] = label
     result["memory_match_score"] = round(score, 4)
     result["memory_suggestion"] = label
+    result["adaptive_threshold_used"] = round(adaptive_auto_threshold, 4)
+    result["feedback_consistency_snapshot"] = {
+        "positive_feedback_count": positive_count,
+        "negative_feedback_count": negative_count,
+        "correction_consistency_score": round(consistency, 4),
+    }
 
     base_label = str(result.get("decision_label", "")).strip().lower()
     base_conf = float(result.get("confidence_score", 0.0))
 
-    if score >= cfg.learning_auto_threshold:
+    if match_locked and score >= adaptive_auto_threshold:
+        result["memory_applied"] = True
+        result["learning_applied"] = True
+        result["female_found"] = True
+        result["suggested_folder_name"] = label
+        result["suggested_cluster_id"] = None
+        set_decision(
+            result,
+            "female_detected",
+            (
+                f"Applied locked identity memory match: {label} "
+                f"(score={score:.3f}, adaptive_threshold={adaptive_auto_threshold:.3f})."
+            ),
+            max(base_conf, score),
+        )
+        return
+
+    if score >= adaptive_auto_threshold:
         confidence_gap_clear = (score - base_conf) >= 0.18 or base_conf < 0.65
         if base_label == "female_detected" or confidence_gap_clear:
             result["memory_applied"] = True
+            result["learning_applied"] = True
             result["female_found"] = True
             result["suggested_folder_name"] = label
+            result["suggested_cluster_id"] = None
             set_decision(
                 result,
                 "female_detected",
-                f"Applied learned identity memory match: {label} (score={score:.3f}).",
+                (
+                    f"Applied learned identity memory match: {label} "
+                    f"(score={score:.3f}, adaptive_threshold={adaptive_auto_threshold:.3f})."
+                ),
                 max(base_conf, score),
             )
             return
@@ -1048,7 +1627,10 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
         set_decision(
             result,
             "uncertain",
-            f"Memory suggests {label} (score={score:.3f}) but confidence is below auto-apply threshold.",
+            (
+                f"Memory suggests {label} (score={score:.3f}) but confidence is below "
+                f"adaptive auto-apply threshold ({adaptive_auto_threshold:.3f})."
+            ),
             max(base_conf, min(0.8, score)),
         )
 
@@ -1056,6 +1638,9 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
 def update_learning_from_review_item(
     updated_item: Dict[str, Any],
     memory: Dict[str, Any],
+    *,
+    learning_auto_threshold: float = 0.82,
+    learning_suggest_threshold: float = 0.74,
 ) -> bool:
     action = str(updated_item.get("review_action", "")).strip().lower()
     if action not in {"approve_suggested", "move_no_female", "reassign_existing", "reassign_new"}:
@@ -1066,18 +1651,66 @@ def update_learning_from_review_item(
     if not final_label:
         return False
 
+    predicted_label = str(updated_item.get("predicted_label", ""))
+    memory_match_label = str(updated_item.get("memory_match_label", "")).strip()
+    suggested_folder = str(updated_item.get("suggested_folder", "")).strip()
+    source_path = str(updated_item.get("source_path", ""))
+    confidence = float(updated_item.get("confidence", 0.0))
+    embedding = updated_item.get("embedding")
+    memory_match_score = float(updated_item.get("memory_match_score", 0.0))
+    source_action = f"review_{action}"
+
     record_feedback(
         memory,
         action=action,
+        source_action=source_action,
+        feedback_event_type="positive",
         label=final_label,
-        predicted_label=str(updated_item.get("predicted_label", "")),
-        confidence=float(updated_item.get("confidence", 0.0)),
-        source_path=str(updated_item.get("source_path", "")),
+        predicted_label=predicted_label,
+        confidence=confidence,
+        source_path=source_path,
         final_path=str(final_path),
-        embedding=updated_item.get("embedding"),
-        memory_match_label=str(updated_item.get("memory_match_label", "")),
-        memory_match_score=float(updated_item.get("memory_match_score", 0.0)),
+        embedding=embedding,
+        memory_match_label=memory_match_label,
+        memory_match_score=memory_match_score,
+        from_label=predicted_label,
+        to_label=final_label,
+        global_auto_threshold=learning_auto_threshold,
+        global_suggest_threshold=learning_suggest_threshold,
     )
+
+    negative_candidate = ""
+    if action in {"reassign_existing", "reassign_new"}:
+        if memory_match_label and memory_match_label.lower() != final_label.lower():
+            negative_candidate = memory_match_label
+        elif suggested_folder and suggested_folder.lower() != final_label.lower():
+            negative_candidate = suggested_folder
+    elif action == "move_no_female":
+        if memory_match_label and memory_match_label.lower() != "no_female_found":
+            negative_candidate = memory_match_label
+        elif suggested_folder and suggested_folder.lower() != "no_female_found":
+            negative_candidate = suggested_folder
+
+    if negative_candidate:
+        record_feedback(
+            memory,
+            action=action,
+            source_action=source_action,
+            feedback_event_type="negative",
+            label=final_label,
+            predicted_label=predicted_label,
+            confidence=confidence,
+            source_path=source_path,
+            final_path=str(final_path),
+            embedding=None,
+            memory_match_label=memory_match_label,
+            memory_match_score=memory_match_score,
+            from_label=negative_candidate,
+            to_label=final_label,
+            negative_label=negative_candidate,
+            global_auto_threshold=learning_auto_threshold,
+            global_suggest_threshold=learning_suggest_threshold,
+        )
     return True
 
 
@@ -1088,24 +1721,7 @@ def process_video(video_path: str) -> Dict[str, Any]:
 
     print(f"[START] {video_name}", flush=True)
 
-    result: Dict[str, Any] = {
-        "video": video_path,
-        "female_found": False,
-        "embedding": None,
-        "error": None,
-        "stopped": False,
-        "samples_used": 0,
-        "device": ACTIVE_ACCELERATION,
-        "decision_label": "unknown",
-        "decision_reason": "",
-        "confidence_score": 0.0,
-        "suggested_cluster_id": None,
-        "suggested_folder_name": "",
-        "memory_match_label": "",
-        "memory_match_score": 0.0,
-        "memory_applied": False,
-        "memory_suggestion": "",
-    }
+    result: Dict[str, Any] = new_result_record(video_path, ACTIVE_ACCELERATION)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1130,6 +1746,13 @@ def process_video(video_path: str) -> Dict[str, Any]:
             cfg,
             video_name,
         )
+        reason_metrics = _normalize_reason_metrics(result.get("reason_metrics"))
+        reason_metrics["female_seed_hits"] = int(scan_info.get("female_seed_hits", 0))
+        reason_metrics["best_seed_confidence"] = round(float(scan_info.get("best_seed_confidence", 0.0)), 4)
+        reason_metrics["total_faces_evaluated"] = int(scan_info.get("total_faces_evaluated", 0))
+        reason_metrics["low_face_area_rejections"] = int(scan_info.get("low_face_area_rejections", 0))
+        result["reason_metrics"] = reason_metrics
+
         if (
             first_ts is None
             or first_box is None
@@ -1156,7 +1779,7 @@ def process_video(video_path: str) -> Dict[str, Any]:
                 print(f"[NO FEMALE] {video_name}", flush=True)
             return result
 
-        kept_embeddings, female_score, male_score, gender_votes = stabilize_identity(
+        kept_embeddings, female_score, male_score, gender_votes, stabilize_info = stabilize_identity(
             cap=cap,
             fps=fps,
             total_frames=total_frames,
@@ -1169,6 +1792,19 @@ def process_video(video_path: str) -> Dict[str, Any]:
             cfg=cfg,
             video_name=video_name,
         )
+        reason_metrics = _normalize_reason_metrics(result.get("reason_metrics"))
+        reason_metrics["total_faces_evaluated"] = int(reason_metrics.get("total_faces_evaluated", 0)) + int(
+            stabilize_info.get("total_faces_evaluated", 0)
+        )
+        reason_metrics["low_face_area_rejections"] = int(reason_metrics.get("low_face_area_rejections", 0)) + int(
+            stabilize_info.get("low_face_area_rejections", 0)
+        )
+        reason_metrics["stable_embeddings"] = len(kept_embeddings)
+        reason_metrics["gender_votes"] = int(gender_votes)
+        reason_metrics["female_score"] = round(float(female_score), 4)
+        reason_metrics["male_score"] = round(float(male_score), 4)
+        result["reason_metrics"] = reason_metrics
+
         if not kept_embeddings:
             set_decision(result, "uncertain", "Female candidate detected but identity could not be stabilized.", 0.4)
             print(f"[UNCERTAIN] {video_name} no stable identity", flush=True)
@@ -1303,6 +1939,11 @@ def cluster_embeddings(video_results: Sequence[Dict[str, Any]], eps: float, min_
 def move_video(src: Path, dst_dir: Path) -> Path:
     ensure_dir(dst_dir)
     dst = dst_dir / src.name
+    try:
+        if src.resolve() == dst.resolve():
+            return src
+    except Exception:
+        pass
     if dst.exists():
         stem = src.stem
         suffix = src.suffix
@@ -1322,6 +1963,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", default=".", help="Directory containing source videos")
     parser.add_argument("--output-dir", default=".", help="Directory to place sorted videos")
     parser.add_argument(
+        "--profile",
+        default=PROFILE_BALANCED,
+        help="Quality preset: fast, balanced, or high_accuracy (aliases: high-accuracy, high accuracy).",
+    )
+    parser.add_argument(
         "--print-runtime-json",
         action="store_true",
         help="Print detected GPU/CPU runtime info as JSON and exit",
@@ -1337,6 +1983,11 @@ def parse_args() -> argparse.Namespace:
         help="Also scan videos inside generated folders such as Female_* and No_Female_Found",
     )
     parser.add_argument(
+        "--reprocess-uncertain-only",
+        action="store_true",
+        help="Reprocess only videos currently in <output-dir>/Uncertain using stricter settings",
+    )
+    parser.add_argument(
         "--review-mode",
         action="store_true",
         help="Route female_detected and uncertain videos to Review_Pending and write review queue state",
@@ -1347,12 +1998,40 @@ def parse_args() -> argparse.Namespace:
         help="Print review queue state JSON for --output-dir and exit",
     )
     parser.add_argument(
+        "--duplicates-scan-json",
+        action="store_true",
+        help="Scan output identity folders and print duplicate groups JSON",
+    )
+    parser.add_argument(
+        "--duplicates-apply-json",
+        default="",
+        help="Apply duplicate move action from JSON payload (expects {'paths':[...]}).",
+    )
+    parser.add_argument(
+        "--identity-list-json",
+        action="store_true",
+        help="Print identity folders JSON for --output-dir and exit",
+    )
+    parser.add_argument(
         "--review-action",
         default="",
         help="Apply one review action: approve_suggested, move_no_female, reassign_existing, reassign_new, skip",
     )
     parser.add_argument("--review-item-id", default="", help="Review item id for --review-action")
     parser.add_argument("--review-target-folder", default="", help="Target folder for reassign review actions")
+    parser.add_argument(
+        "--identity-action",
+        default="",
+        help="Apply one identity action: merge, split, lock, unlock",
+    )
+    parser.add_argument("--identity-source-folder", default="", help="Source identity folder for merge/split")
+    parser.add_argument("--identity-target-folder", default="", help="Target identity folder for merge/split")
+    parser.add_argument("--identity-folder", default="", help="Identity folder for lock/unlock")
+    parser.add_argument(
+        "--identity-video-paths-json",
+        default="[]",
+        help="JSON list of source video paths for identity split action",
+    )
     parser.add_argument(
         "--learning-enabled",
         dest="learning_enabled",
@@ -1382,6 +2061,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.74,
         help="Mark uncertain with memory suggestion when similarity is at least this value",
+    )
+    parser.add_argument(
+        "--learning-summary-json",
+        action="store_true",
+        help="Print learning memory summary JSON with adaptive thresholds and correction trends",
     )
     parser.add_argument(
         "--stop-flag-file",
@@ -1491,11 +2175,93 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    cli_tokens = sys.argv[1:]
+    selected_profile = apply_profile_defaults(args, cli_tokens)
+    if bool(args.reprocess_uncertain_only):
+        selected_profile = apply_uncertain_reprocess_defaults(args, cli_tokens)
     output_dir = Path(args.output_dir).expanduser().resolve()
+
+    temp_cfg = Config(
+        input_dir=".",
+        output_dir=str(output_dir),
+        profile=selected_profile,
+        learning_enabled=bool(args.learning_enabled),
+        learning_memory_file=str(args.learning_memory_file or ""),
+        learning_auto_threshold=float(args.learning_auto_threshold),
+        learning_suggest_threshold=float(args.learning_suggest_threshold),
+    )
+    memory_path = memory_file_path(temp_cfg)
 
     if args.print_runtime_json:
         print(json.dumps(get_runtime_info()))
         return 0
+
+    if args.learning_summary_json:
+        memory = load_memory(memory_path)
+        payload = build_learning_summary(
+            memory,
+            global_auto_threshold=float(args.learning_auto_threshold),
+            global_suggest_threshold=float(args.learning_suggest_threshold),
+        )
+        payload["memory_file"] = str(memory_path)
+        print(json.dumps(payload))
+        return 0
+
+    if args.duplicates_scan_json:
+        payload = scan_duplicates(output_dir)
+        print(json.dumps(payload))
+        return 0
+
+    if str(args.duplicates_apply_json or "").strip():
+        try:
+            payload_obj = json.loads(str(args.duplicates_apply_json))
+            payload = apply_duplicate_move(
+                output_dir,
+                payload_obj,
+                memory_path=memory_path if bool(args.learning_enabled) else None,
+                learning_auto_threshold=float(args.learning_auto_threshold),
+                learning_suggest_threshold=float(args.learning_suggest_threshold),
+            )
+            state = load_review_state(output_dir)
+            payload["pending_count"] = len(pending_review_items(state))
+            print(json.dumps(payload))
+            return 0
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+
+    if args.identity_list_json:
+        memory = load_memory(memory_path)
+        payload = list_identities(output_dir, memory)
+        payload["memory_file"] = str(memory_path)
+        print(json.dumps(payload))
+        return 0
+
+    if args.identity_action:
+        try:
+            selected_videos: List[str] = []
+            if args.identity_video_paths_json.strip():
+                parsed = json.loads(args.identity_video_paths_json)
+                if not isinstance(parsed, list):
+                    raise RuntimeError("--identity-video-paths-json must be a JSON array")
+                selected_videos = [str(item) for item in parsed]
+
+            payload = perform_identity_action(
+                output_dir=output_dir,
+                memory_path=memory_path,
+                action=str(args.identity_action or ""),
+                source_folder=str(args.identity_source_folder or ""),
+                target_folder=str(args.identity_target_folder or ""),
+                folder_name=str(args.identity_folder or ""),
+                selected_videos=selected_videos,
+            )
+            state = load_review_state(output_dir)
+            payload["pending_count"] = len(pending_review_items(state))
+            print(json.dumps(payload))
+            return 0
+        except Exception as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
 
     if args.review_list_json:
         state = load_review_state(output_dir)
@@ -1517,17 +2283,13 @@ def main() -> int:
             learning_updated = False
             learning_match: Dict[str, Any] = {}
             if bool(args.learning_enabled):
-                temp_cfg = Config(
-                    input_dir=".",
-                    output_dir=str(output_dir),
-                    learning_enabled=bool(args.learning_enabled),
-                    learning_memory_file=str(args.learning_memory_file or ""),
+                memory = load_memory(memory_path)
+                learning_updated = update_learning_from_review_item(
+                    updated_item,
+                    memory,
                     learning_auto_threshold=float(args.learning_auto_threshold),
                     learning_suggest_threshold=float(args.learning_suggest_threshold),
                 )
-                memory_path = memory_file_path(temp_cfg)
-                memory = load_memory(memory_path)
-                learning_updated = update_learning_from_review_item(updated_item, memory)
                 if learning_updated:
                     save_memory(memory_path, memory)
                     learning_match = {
@@ -1551,18 +2313,25 @@ def main() -> int:
             print(json.dumps({"ok": False, "error": str(exc)}))
             return 1
 
-    input_dir = Path(args.input_dir).expanduser().resolve()
-
-    if not input_dir.is_dir():
-        print(f"Input directory not found: {input_dir}")
-        return 1
-
     ensure_dir(output_dir)
+    if bool(args.reprocess_uncertain_only):
+        input_dir = output_dir / UNCERTAIN_DIRNAME
+        ensure_dir(input_dir)
+        if bool(args.review_mode):
+            print("[INFO] --review-mode is ignored with --reprocess-uncertain-only", flush=True)
+        args.review_mode = False
+    else:
+        input_dir = Path(args.input_dir).expanduser().resolve()
+        if not input_dir.is_dir():
+            print(f"Input directory not found: {input_dir}")
+            return 1
 
     cfg = Config(
         input_dir=str(input_dir),
         output_dir=str(output_dir),
+        profile=selected_profile,
         review_mode=args.review_mode,
+        reprocess_uncertain_only=bool(args.reprocess_uncertain_only),
         learning_enabled=bool(args.learning_enabled),
         learning_memory_file=str(args.learning_memory_file or ""),
         learning_auto_threshold=float(args.learning_auto_threshold),
@@ -1616,7 +2385,15 @@ def main() -> int:
         close_live_preview()
         return 0
 
+    run_started_at = datetime.now(timezone.utc)
+    report_run_id = create_report_run_id(run_started_at)
+
     print(f"Found {len(videos)} videos")
+    print(f"Run id: {report_run_id}")
+    print(f"Preset profile: {cfg.profile}")
+    print(f"Reprocess uncertain only: {cfg.reprocess_uncertain_only}")
+    if cfg.reprocess_uncertain_only:
+        print(f"Uncertain bucket: {output_dir / UNCERTAIN_DIRNAME}")
     print(f"Recursive child-folder scan: {cfg.recursive}")
     print(f"Include generated folders: {cfg.include_generated_folders}")
     print(f"Review mode: {cfg.review_mode}")
@@ -1672,26 +2449,15 @@ def main() -> int:
             try:
                 result = process_video(str(video))
                 apply_memory_assist(result, memory, cfg)
+                apply_explainability_metadata(result, cfg)
+                emit_result_json(result)
                 results.append(result)
             except Exception as exc:
-                result = {
-                    "video": str(video),
-                    "female_found": False,
-                    "embedding": None,
-                    "error": f"Worker failure: {exc}",
-                    "stopped": False,
-                    "samples_used": 0,
-                    "device": ACTIVE_ACCELERATION,
-                    "decision_label": "error",
-                    "decision_reason": f"Worker failure: {exc}",
-                    "confidence_score": 0.0,
-                    "suggested_cluster_id": None,
-                    "suggested_folder_name": "",
-                    "memory_match_label": "",
-                    "memory_match_score": 0.0,
-                    "memory_applied": False,
-                    "memory_suggestion": "",
-                }
+                result = new_result_record(str(video), ACTIVE_ACCELERATION)
+                result["error"] = f"Worker failure: {exc}"
+                set_decision(result, "error", f"Worker failure: {exc}", 0.0)
+                apply_explainability_metadata(result, cfg)
+                emit_result_json(result)
                 results.append(result)
 
             if result.get("stopped"):
@@ -1736,26 +2502,15 @@ def main() -> int:
                 try:
                     result = future.result()
                     apply_memory_assist(result, memory, cfg)
+                    apply_explainability_metadata(result, cfg)
+                    emit_result_json(result)
                     results.append(result)
                 except Exception as exc:
-                    result = {
-                        "video": str(video),
-                        "female_found": False,
-                        "embedding": None,
-                        "error": f"Worker failure: {exc}",
-                        "samples_used": 0,
-                        "device": "unknown",
-                        "decision_label": "error",
-                        "decision_reason": f"Worker failure: {exc}",
-                        "confidence_score": 0.0,
-                        "stopped": False,
-                        "suggested_cluster_id": None,
-                        "suggested_folder_name": "",
-                        "memory_match_label": "",
-                        "memory_match_score": 0.0,
-                        "memory_applied": False,
-                        "memory_suggestion": "",
-                    }
+                    result = new_result_record(str(video), "unknown")
+                    result["error"] = f"Worker failure: {exc}"
+                    set_decision(result, "error", f"Worker failure: {exc}", 0.0)
+                    apply_explainability_metadata(result, cfg)
+                    emit_result_json(result)
                     results.append(result)
 
                 if result.get("stopped"):
@@ -1799,6 +2554,22 @@ def main() -> int:
     failed_results = [item for item in results if item.get("error")]
     stopped_results = [item for item in results if item.get("stopped")]
     if not successful_results:
+        counts = derive_decision_counts(results)
+        run_finished_at = datetime.now(timezone.utc)
+        emit_run_reports(
+            output_dir=output_dir,
+            run_id=report_run_id,
+            run_started_at=run_started_at,
+            run_finished_at=run_finished_at,
+            total_scanned=len(videos),
+            processed_successfully=counts["processed_successfully"],
+            female_detected=counts["female_detected"],
+            uncertain=counts["uncertain"],
+            no_female_found=counts["no_female_found"],
+            errors=counts["errors"],
+            stopped_early=stopped_early,
+            results=results,
+        )
         if stopped_early or stopped_results:
             print("\n[STOP] No completed videos to move yet. Stopped cleanly.")
             close_live_preview()
@@ -1836,6 +2607,7 @@ def main() -> int:
     memory_applied_count = 0
     queue_items: List[Dict[str, Any]] = []
     no_female_dir = output_dir / "No_Female_Found"
+    uncertain_dir = output_dir / UNCERTAIN_DIRNAME
 
     for item in tqdm(results, desc="Sorting videos", disable=progress_disabled):
         if item.get("error") or item.get("stopped"):
@@ -1845,6 +2617,14 @@ def main() -> int:
             continue
 
         decision_label = str(item.get("decision_label", "")).strip().lower()
+        if decision_label == "uncertain":
+            uncertain_count += 1
+            moved_path = move_video(src, uncertain_dir)
+            item["final_destination"] = str(moved_path)
+            if moved_path != src:
+                moved_count += 1
+            continue
+
         route = decide_review_route(item, cfg.review_mode)
 
         if route == "queue":
@@ -1854,6 +2634,7 @@ def main() -> int:
             suggested_folder = sanitize_folder_name(suggested_folder)
             pending_dir = output_dir / REVIEW_PENDING_DIRNAME / suggested_folder
             pending_path = move_video(src, pending_dir)
+            item["final_destination"] = str(pending_path)
             moved_count += 1
             queued_count += 1
             if decision_label == "female_detected":
@@ -1896,24 +2677,39 @@ def main() -> int:
             dst_name = cluster_folder_names.get(cluster_id, f"Female_{cluster_id}")
             dst_dir = output_dir / sanitize_folder_name(dst_name)
         else:
-            if decision_label == "uncertain":
-                uncertain_count += 1
-            else:
-                no_female_count += 1
+            no_female_count += 1
             dst_dir = no_female_dir
 
-        move_video(src, dst_dir)
+        moved_path = move_video(src, dst_dir)
+        item["final_destination"] = str(moved_path)
         moved_count += 1
 
     if cfg.review_mode:
-        run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
-        state = create_review_state(output_dir, queue_items, run_id)
+        queue_run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+        state = create_review_state(output_dir, queue_items, queue_run_id)
         save_review_state(output_dir, state)
         print(
-            f"\n[REVIEW_QUEUE] run_id={run_id} queued={len(queue_items)} "
+            f"\n[REVIEW_QUEUE] run_id={queue_run_id} queued={len(queue_items)} "
             f"state={review_state_path(output_dir)}",
             flush=True,
         )
+
+    run_finished_at = datetime.now(timezone.utc)
+    time_taken_seconds = max(0.0, (run_finished_at - run_started_at).total_seconds())
+    emit_run_reports(
+        output_dir=output_dir,
+        run_id=report_run_id,
+        run_started_at=run_started_at,
+        run_finished_at=run_finished_at,
+        total_scanned=len(videos),
+        processed_successfully=len(successful_results),
+        female_detected=female_count,
+        uncertain=uncertain_count,
+        no_female_found=no_female_count,
+        errors=len(failed_results),
+        stopped_early=stopped_early,
+        results=results,
+    )
 
     print("\n===== Summary =====")
     print(f"Total videos: {len(videos)}")
@@ -1928,6 +2724,12 @@ def main() -> int:
     print(f"Memory auto-applied: {memory_applied_count}")
     print(f"Moved videos: {moved_count}")
     print(f"Videos left in source: {max(0, len(videos) - moved_count)}")
+    if cfg.reprocess_uncertain_only:
+        print(
+            f"[UNCERTAIN_RERUN] processed={len(successful_results)} "
+            f"reclassified={female_count + no_female_count} remaining_uncertain={uncertain_count}"
+        )
+    print(f"Time taken (sec): {time_taken_seconds:.3f}")
     print(f"Output directory: {output_dir}")
     print("===================")
     close_live_preview()

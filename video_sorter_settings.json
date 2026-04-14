@@ -1,13 +1,15 @@
 {
-  "source_folder": "D:/New folder/No_Female_Found",
-  "destination_folder": "D:/sorted",
+  "source_folder": "D:/sorted",
+  "destination_folder": "D:/temp sorted",
   "recursive": true,
   "include_generated_folders": true,
   "review_mode": true,
+  "learning_enabled": true,
   "live_trace": false,
-  "max_seconds": "60",
+  "max_seconds": "200",
   "sample_every_sec": "2.0",
   "stabilization_seconds": "10",
   "resize_width": "960",
-  "max_workers": "1"
+  "max_workers": "1",
+  "profile": "balanced"
 }

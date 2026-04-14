@@ -100,6 +100,95 @@ class MemoryAssistTests(unittest.TestCase):
         self.assertFalse(result["female_found"])
         self.assertIsNone(result["suggested_cluster_id"])
 
+    def test_locked_identity_forces_auto_apply_at_threshold(self) -> None:
+        cfg = self._cfg()
+        memory = {
+            "identities": [
+                {
+                    "label": "Female_Locked",
+                    "prototype": [1.0, 0.0, 0.0],
+                    "sample_count": 6,
+                    "confidence_sum": 5.4,
+                    "locked": True,
+                    "locked_at": "2026-01-01T00:00:00+00:00",
+                }
+            ]
+        }
+        result = {
+            "decision_label": "no_female",
+            "decision_reason": "native pipeline says no female",
+            "confidence_score": 0.95,
+            "embedding": [0.96, 0.04, 0.0],
+            "female_found": False,
+            "suggested_folder_name": "",
+            "suggested_cluster_id": 8,
+        }
+
+        apply_memory_assist(result, memory, cfg)
+        self.assertTrue(result["memory_applied"])
+        self.assertEqual(result["decision_label"], "female_detected")
+        self.assertEqual(result["suggested_folder_name"], "Female_Locked")
+        self.assertFalse("no_female" in result["decision_reason"])
+        self.assertIsNone(result["suggested_cluster_id"])
+
+    def test_adaptive_threshold_can_auto_apply_below_global_auto(self) -> None:
+        cfg = self._cfg()
+        memory = {
+            "identities": [
+                {
+                    "label": "Female_Adaptive",
+                    "prototype": [1.0, 0.0, 0.0],
+                    "sample_count": 10,
+                    "confidence_sum": 8.0,
+                    "positive_feedback_count": 25,
+                    "negative_feedback_count": 0,
+                }
+            ]
+        }
+        result = {
+            "decision_label": "uncertain",
+            "decision_reason": "native confidence low",
+            "confidence_score": 0.35,
+            "embedding": [0.78, 0.62, 0.0],
+            "female_found": False,
+            "suggested_folder_name": "",
+            "suggested_cluster_id": 2,
+        }
+
+        apply_memory_assist(result, memory, cfg)
+        self.assertTrue(result["memory_applied"])
+        self.assertTrue(result["learning_applied"])
+        self.assertEqual(result["decision_label"], "female_detected")
+        self.assertLess(float(result["adaptive_threshold_used"]), cfg.learning_auto_threshold)
+
+    def test_conflicting_feedback_keeps_threshold_conservative(self) -> None:
+        cfg = self._cfg()
+        memory = {
+            "identities": [
+                {
+                    "label": "Female_Conflicting",
+                    "prototype": [1.0, 0.0, 0.0],
+                    "sample_count": 15,
+                    "confidence_sum": 12.0,
+                    "positive_feedback_count": 20,
+                    "negative_feedback_count": 20,
+                }
+            ]
+        }
+        result = {
+            "decision_label": "no_female",
+            "decision_reason": "none found",
+            "confidence_score": 0.30,
+            "embedding": [0.78, 0.62, 0.0],
+            "female_found": False,
+            "suggested_folder_name": "",
+        }
+
+        apply_memory_assist(result, memory, cfg)
+        self.assertFalse(result["memory_applied"])
+        self.assertEqual(result["decision_label"], "uncertain")
+        self.assertAlmostEqual(float(result["adaptive_threshold_used"]), cfg.learning_auto_threshold, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()
