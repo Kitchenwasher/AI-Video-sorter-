@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from datetime import datetime, timezone
@@ -7,7 +8,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from folder_naming import sanitize_folder_name
-from learning_memory import load_memory, normalize_embedding, record_structural_feedback, refresh_all_identity_stats, save_memory
+from learning_memory import (
+    load_memory,
+    normalize_embedding,
+    record_feedback,
+    record_structural_feedback,
+    refresh_all_identity_stats,
+    save_memory,
+)
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -20,6 +28,9 @@ EXCLUDED_DIRS = {
     ".model_cache",
     "__pycache__",
 }
+EMBEDDING_CACHE_DIRNAME = ".learning"
+EMBEDDING_CACHE_FILENAME = "video_embedding_cache.json"
+EMBEDDING_CACHE_SCHEMA_VERSION = 1
 
 
 def utc_now_iso() -> str:
@@ -28,6 +39,110 @@ def utc_now_iso() -> str:
 
 def is_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTS
+
+
+def _embedding_cache_path(output_dir: Path, embedding_cache_file: str = "") -> Path:
+    explicit = str(embedding_cache_file or "").strip()
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.is_absolute():
+            return path
+        return (output_dir / path).resolve()
+    return output_dir / EMBEDDING_CACHE_DIRNAME / EMBEDDING_CACHE_FILENAME
+
+
+def _normalize_cache_key(path_text: str) -> str:
+    return os.path.normcase(os.path.normpath(str(path_text).strip()))
+
+
+def _load_embedding_cache(output_dir: Path, embedding_cache_file: str = "") -> Dict[str, Any]:
+    path = _embedding_cache_path(output_dir, embedding_cache_file)
+    if not path.exists():
+        return {"schema_version": EMBEDDING_CACHE_SCHEMA_VERSION, "updated_at": "", "entries": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"schema_version": EMBEDDING_CACHE_SCHEMA_VERSION, "updated_at": "", "entries": {}}
+    if not isinstance(data, dict):
+        return {"schema_version": EMBEDDING_CACHE_SCHEMA_VERSION, "updated_at": "", "entries": {}}
+    entries = data.get("entries", {})
+    if not isinstance(entries, dict):
+        entries = {}
+    data["schema_version"] = EMBEDDING_CACHE_SCHEMA_VERSION
+    data["entries"] = entries
+    data.setdefault("updated_at", "")
+    return data
+
+
+def _save_embedding_cache(output_dir: Path, cache: Dict[str, Any], embedding_cache_file: str = "") -> None:
+    path = _embedding_cache_path(output_dir, embedding_cache_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cache["schema_version"] = EMBEDDING_CACHE_SCHEMA_VERSION
+    cache["updated_at"] = utc_now_iso()
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _apply_learning_feedback_from_cache_entry(
+    memory: Dict[str, Any],
+    *,
+    source_action: str,
+    from_label: str,
+    to_label: str,
+    source_path: str,
+    final_path: str,
+    cache_entry: Optional[Dict[str, Any]],
+) -> bool:
+    if not isinstance(cache_entry, dict):
+        return False
+    embedding = cache_entry.get("embedding")
+    embedding_vec = normalize_embedding(embedding if isinstance(embedding, list) else [])
+    if embedding_vec is None:
+        return False
+
+    confidence = _safe_float(cache_entry.get("confidence_score", 0.0), 0.0)
+    predicted_label = from_label or str(cache_entry.get("decision_label", "")).strip()
+    final_label = to_label
+
+    record_feedback(
+        memory,
+        action=source_action,
+        source_action=source_action,
+        feedback_event_type="positive",
+        label=final_label,
+        predicted_label=predicted_label,
+        confidence=confidence,
+        source_path=source_path,
+        final_path=final_path,
+        embedding=embedding_vec.tolist(),
+        from_label=from_label,
+        to_label=to_label,
+    )
+    if from_label.strip().lower() != to_label.strip().lower():
+        record_feedback(
+            memory,
+            action=source_action,
+            source_action=source_action,
+            feedback_event_type="negative",
+            label=final_label,
+            predicted_label=predicted_label,
+            confidence=confidence,
+            source_path=source_path,
+            final_path=final_path,
+            embedding=None,
+            from_label=from_label,
+            to_label=to_label,
+            negative_label=from_label,
+        )
+    return True
 
 
 def _normalize_identity_record(identity: Dict[str, Any], label: str) -> Dict[str, Any]:
@@ -246,7 +361,13 @@ def list_identities(output_dir: Path, memory: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _merge_identity_folders(output_dir: Path, memory: Dict[str, Any], source_folder: str, target_folder: str) -> Dict[str, Any]:
+def _merge_identity_folders(
+    output_dir: Path,
+    memory: Dict[str, Any],
+    source_folder: str,
+    target_folder: str,
+    embedding_cache_file: str = "",
+) -> Dict[str, Any]:
     source_name = source_folder.strip()
     target_name = target_folder.strip()
     if not source_name or not target_name:
@@ -260,6 +381,12 @@ def _merge_identity_folders(output_dir: Path, memory: Dict[str, Any], source_fol
         raise RuntimeError(f"Source identity folder does not exist: {source_dir}")
     if not target_dir.is_dir():
         raise RuntimeError(f"Target identity folder does not exist: {target_dir}")
+
+    cache = _load_embedding_cache(output_dir, embedding_cache_file)
+    cache_entries = cache.get("entries", {})
+    if not isinstance(cache_entries, dict):
+        cache_entries = {}
+        cache["entries"] = cache_entries
 
     moved_map: Dict[str, str] = {}
     moved_count = 0
@@ -320,11 +447,46 @@ def _merge_identity_folders(output_dir: Path, memory: Dict[str, Any], source_fol
         final_path=str(target_dir),
     )
 
+    learning_feedback_with_embeddings = 0
+    learning_feedback_events = 0
+    now_iso = utc_now_iso()
+    for source_path, final_path in moved_map.items():
+        source_key = _normalize_cache_key(source_path)
+        final_key = _normalize_cache_key(final_path)
+        cache_entry_obj: Optional[Dict[str, Any]] = None
+        raw_entry = cache_entries.pop(source_key, None)
+        if isinstance(raw_entry, dict):
+            cache_entry_obj = dict(raw_entry)
+        elif isinstance(cache_entries.get(final_key), dict):
+            cache_entry_obj = dict(cache_entries.get(final_key, {}))
+
+        if cache_entry_obj is not None:
+            cache_entry_obj["video_path"] = final_path
+            cache_entry_obj["updated_at"] = now_iso
+            cache_entries[final_key] = cache_entry_obj
+
+        if _apply_learning_feedback_from_cache_entry(
+            memory,
+            source_action="identity_merge",
+            from_label=source_name,
+            to_label=target_name,
+            source_path=source_path,
+            final_path=final_path,
+            cache_entry=cache_entry_obj,
+        ):
+            learning_feedback_with_embeddings += 1
+            learning_feedback_events += 2 if source_name.lower() != target_name.lower() else 1
+
+    _save_embedding_cache(output_dir, cache, embedding_cache_file)
+
     return {
         "source_folder": source_name,
         "target_folder": target_name,
         "moved_count": moved_count,
         "removed_empty_source": bool(removed_empty_source),
+        "learning_feedback_with_embeddings": learning_feedback_with_embeddings,
+        "learning_feedback_events": learning_feedback_events,
+        "embedding_cache_file": str(_embedding_cache_path(output_dir, embedding_cache_file)),
     }
 
 
@@ -334,6 +496,7 @@ def _split_identity_folder(
     source_folder: str,
     target_folder: str,
     selected_videos: Sequence[str],
+    embedding_cache_file: str = "",
 ) -> Dict[str, Any]:
     source_name = source_folder.strip()
     target_name = sanitize_folder_name(target_folder.strip())
@@ -348,6 +511,12 @@ def _split_identity_folder(
     target_dir = output_dir / target_name
     if not source_dir.is_dir():
         raise RuntimeError(f"Source identity folder does not exist: {source_dir}")
+
+    cache = _load_embedding_cache(output_dir, embedding_cache_file)
+    cache_entries = cache.get("entries", {})
+    if not isinstance(cache_entries, dict):
+        cache_entries = {}
+        cache["entries"] = cache_entries
 
     candidate_paths: List[Path] = []
     for raw in selected_videos:
@@ -397,11 +566,46 @@ def _split_identity_folder(
         final_path=str(target_dir),
     )
 
+    learning_feedback_with_embeddings = 0
+    learning_feedback_events = 0
+    now_iso = utc_now_iso()
+    for source_path, final_path in moved_map.items():
+        source_key = _normalize_cache_key(source_path)
+        final_key = _normalize_cache_key(final_path)
+        cache_entry_obj: Optional[Dict[str, Any]] = None
+        raw_entry = cache_entries.pop(source_key, None)
+        if isinstance(raw_entry, dict):
+            cache_entry_obj = dict(raw_entry)
+        elif isinstance(cache_entries.get(final_key), dict):
+            cache_entry_obj = dict(cache_entries.get(final_key, {}))
+
+        if cache_entry_obj is not None:
+            cache_entry_obj["video_path"] = final_path
+            cache_entry_obj["updated_at"] = now_iso
+            cache_entries[final_key] = cache_entry_obj
+
+        if _apply_learning_feedback_from_cache_entry(
+            memory,
+            source_action="identity_split",
+            from_label=source_name,
+            to_label=target_name,
+            source_path=source_path,
+            final_path=final_path,
+            cache_entry=cache_entry_obj,
+        ):
+            learning_feedback_with_embeddings += 1
+            learning_feedback_events += 2 if source_name.lower() != target_name.lower() else 1
+
+    _save_embedding_cache(output_dir, cache, embedding_cache_file)
+
     return {
         "source_folder": source_name,
         "target_folder": target_name,
         "moved_count": len(moved_map),
         "moved_videos": list(moved_map.values()),
+        "learning_feedback_with_embeddings": learning_feedback_with_embeddings,
+        "learning_feedback_events": learning_feedback_events,
+        "embedding_cache_file": str(_embedding_cache_path(output_dir, embedding_cache_file)),
     }
 
 
@@ -437,6 +641,7 @@ def perform_identity_action(
     *,
     output_dir: Path,
     memory_path: Path,
+    embedding_cache_file: str = "",
     action: str,
     source_folder: str = "",
     target_folder: str = "",
@@ -447,7 +652,13 @@ def perform_identity_action(
     memory = load_memory(memory_path)
 
     if action_key == "merge":
-        details = _merge_identity_folders(output_dir, memory, source_folder, target_folder)
+        details = _merge_identity_folders(
+            output_dir,
+            memory,
+            source_folder,
+            target_folder,
+            embedding_cache_file=embedding_cache_file,
+        )
     elif action_key == "split":
         details = _split_identity_folder(
             output_dir,
@@ -455,6 +666,7 @@ def perform_identity_action(
             source_folder,
             target_folder,
             selected_videos or [],
+            embedding_cache_file=embedding_cache_file,
         )
     elif action_key == "lock":
         details = _lock_identity(output_dir, memory, folder_name, True)

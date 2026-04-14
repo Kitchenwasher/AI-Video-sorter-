@@ -100,7 +100,14 @@ def pending_review_items(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     items = state.get("items", [])
     if not isinstance(items, list):
         return []
-    return [item for item in items if isinstance(item, dict) and item.get("status") == "pending"]
+    pending: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("status") != "pending":
+            continue
+        pending_path = Path(str(item.get("pending_path", "")).strip())
+        if pending_path.exists():
+            pending.append(item)
+    return pending
 
 
 def move_video_collision_safe(src: Path, dst_dir: Path) -> Path:
@@ -120,12 +127,24 @@ def move_video_collision_safe(src: Path, dst_dir: Path) -> Path:
     return dst
 
 
-def decide_review_route(result: Dict[str, Any], review_mode: bool) -> str:
+def decide_review_route(
+    result: Dict[str, Any],
+    review_mode: bool,
+    review_confidence_threshold: float = 0.75,
+) -> str:
     label = str(result.get("decision_label", "")).strip().lower()
     if not review_mode:
         return "direct"
-    if label in {"female_detected", "uncertain"}:
+    if label == "uncertain":
         return "queue"
+    if label == "female_detected":
+        try:
+            confidence = float(result.get("confidence_score", 0.0))
+        except Exception:
+            confidence = 0.0
+        if confidence < float(review_confidence_threshold):
+            return "queue"
+        return "direct"
     if label == "no_female":
         return "direct_no_female"
     return "direct"

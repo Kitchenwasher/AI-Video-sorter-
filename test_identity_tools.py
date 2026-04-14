@@ -1,3 +1,5 @@
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -173,6 +175,62 @@ class IdentityToolsTests(unittest.TestCase):
                     str(item.get("feedback_event_type", "")) == "structural"
                     and str(item.get("source_action", "")) == "identity_split"
                     for item in updated["decisions"]
+                )
+            )
+
+    def test_merge_uses_embedding_cache_for_learning_feedback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            source_dir = output_dir / "Female_A"
+            target_dir = output_dir / "Female_B"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            clip = source_dir / "clip.mp4"
+            clip.write_bytes(b"clip-a")
+
+            cache_path = output_dir / ".learning" / "video_embedding_cache.json"
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_payload = {
+                "schema_version": 1,
+                "updated_at": "2026-04-14T10:00:00+00:00",
+                "entries": {
+                    os.path.normcase(os.path.normpath(str(clip.resolve()))): {
+                        "video_path": str(clip.resolve()),
+                        "source_video_path": str(clip.resolve()),
+                        "decision_label": "female_detected",
+                        "confidence_score": 0.91,
+                        "embedding": [1.0, 0.0, 0.0],
+                        "updated_at": "2026-04-14T10:00:00+00:00",
+                    }
+                },
+            }
+            cache_path.write_text(json.dumps(cache_payload, indent=2), encoding="utf-8")
+
+            mem_path = default_memory_path(output_dir)
+            result = perform_identity_action(
+                output_dir=output_dir,
+                memory_path=mem_path,
+                action="merge",
+                source_folder="Female_A",
+                target_folder="Female_B",
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["details"]["learning_feedback_with_embeddings"], 1)
+            self.assertEqual(result["details"]["learning_feedback_events"], 2)
+
+            updated = load_memory(mem_path)
+            self.assertTrue(
+                any(
+                    str(item.get("source_action", "")) == "identity_merge"
+                    and str(item.get("feedback_event_type", "")) == "positive"
+                    for item in updated.get("decisions", [])
+                )
+            )
+            self.assertTrue(
+                any(
+                    str(item.get("source_action", "")) == "identity_merge"
+                    and str(item.get("feedback_event_type", "")) == "negative"
+                    for item in updated.get("decisions", [])
                 )
             )
 
