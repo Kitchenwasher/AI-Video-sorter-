@@ -139,6 +139,7 @@ class VideoSorterGUI:
 
         self.process: subprocess.Popen[str] | None = None
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.runtime_refresh_queue: queue.Queue[tuple[int, str, str]] = queue.Queue()
         self.reader_thread: threading.Thread | None = None
         self.stop_flag_path: Path | None = None
         self.stop_requested = False
@@ -163,6 +164,8 @@ class VideoSorterGUI:
         self.live_trace_button_var = tk.StringVar()
         self.max_seconds_var = tk.StringVar(value="60")
         self.sample_every_var = tk.StringVar(value="2.0")
+        self.retry_checkpoint_step_pct_var = tk.IntVar(value=5)
+        self.retry_checkpoint_step_label_var = tk.StringVar()
         self.stabilization_var = tk.StringVar(value="8.0")
         self.resize_width_var = tk.StringVar(value="960")
         self.max_workers_var = tk.StringVar(value="2")
@@ -218,6 +221,7 @@ class VideoSorterGUI:
         self.main_scroll_canvas: tk.Canvas | None = None
         self.main_scroll_content: ttk.Frame | None = None
         self.main_scroll_window_id: int | None = None
+        self._runtime_refresh_token = 0
 
         self._load_settings()
         self._update_include_generated_button_text()
@@ -228,6 +232,7 @@ class VideoSorterGUI:
         self._update_cross_video_reid_button_text()
         self._update_video_io_prefetch_button_text()
         self._update_live_trace_button_text()
+        self._update_retry_checkpoint_step_label()
         self._build_ui()
         self._dashboard_reset()
         self._update_reprocess_button_state()
@@ -272,6 +277,32 @@ class VideoSorterGUI:
                 return
             self.main_scroll_canvas.itemconfigure(self.main_scroll_window_id, width=event.width)
 
+        def _is_descendant(widget: Any, ancestor: Any) -> bool:
+            current = widget
+            while current is not None:
+                if current is ancestor:
+                    return True
+                current = getattr(current, "master", None)
+            return False
+
+        def _is_native_scroll_widget(widget: Any) -> bool:
+            current = widget
+            while current is not None:
+                try:
+                    klass = str(current.winfo_class())
+                except Exception:
+                    klass = ""
+                if klass in {"Text", "Treeview", "Listbox"}:
+                    return True
+                current = getattr(current, "master", None)
+            return False
+
+        def _should_skip_global_scroll(widget: Any) -> bool:
+            log_widget = getattr(self, "log_text", None)
+            if bool(log_widget is not None and _is_descendant(widget, log_widget)):
+                return True
+            return _is_native_scroll_widget(widget)
+
         def _on_mousewheel(event: tk.Event[tk.Misc]) -> None:
             if self.main_scroll_canvas is None:
                 return
@@ -288,6 +319,8 @@ class VideoSorterGUI:
                     return
             except Exception:
                 return
+            if _should_skip_global_scroll(widget):
+                return
             delta = int(getattr(event, "delta", 0))
             if delta != 0:
                 self.main_scroll_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
@@ -300,6 +333,8 @@ class VideoSorterGUI:
                 if widget is None or widget.winfo_toplevel() != self.root:
                     return
             except Exception:
+                return
+            if _should_skip_global_scroll(widget):
                 return
             direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
             self.main_scroll_canvas.yview_scroll(direction, "units")
@@ -419,12 +454,22 @@ class VideoSorterGUI:
             command=self._toggle_cross_video_reid,
         ).grid(row=6, column=1, sticky="ew", padx=(0, 10), pady=(0, 2))
 
+        ttk.Label(options, textvariable=self.retry_checkpoint_step_label_var).grid(
+            row=7, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Button(options, text="-5%", command=lambda: self._adjust_retry_checkpoint_step_pct(-5)).grid(
+            row=7, column=1, sticky="ew", padx=(0, 10), pady=(8, 0)
+        )
+        ttk.Button(options, text="+5%", command=lambda: self._adjust_retry_checkpoint_step_pct(5)).grid(
+            row=7, column=2, sticky="ew", padx=(0, 10), pady=(8, 0)
+        )
+
         ttk.Label(
             options,
             text="Source videos are discovered by extension and sorted from child folders too when recursive scan is enabled.",
             wraplength=760,
             foreground="#444444",
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(12, 0))
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(12, 0))
 
         log_frame = ttk.LabelFrame(content, text="Logs", padding=10)
         log_frame.grid(row=3, column=0, sticky="nsew", padx=14, pady=(0, 10))
@@ -981,6 +1026,28 @@ class VideoSorterGUI:
         else:
             self.live_trace_button_var.set("Live Preview: Off")
 
+    def _update_retry_checkpoint_step_label(self) -> None:
+        value = int(self.retry_checkpoint_step_pct_var.get())
+        value = max(5, min(95, value))
+        if value % 5 != 0:
+            value = int(round(value / 5.0) * 5)
+            value = max(5, min(95, value))
+        self.retry_checkpoint_step_pct_var.set(value)
+        self.retry_checkpoint_step_label_var.set(f"Retry Checkpoint Step: {value}%")
+
+    def _adjust_retry_checkpoint_step_pct(self, delta: int) -> None:
+        current = int(self.retry_checkpoint_step_pct_var.get())
+        updated = current + int(delta)
+        updated = max(5, min(95, updated))
+        if updated % 5 != 0:
+            updated = int(round(updated / 5.0) * 5)
+            updated = max(5, min(95, updated))
+        if updated == current:
+            return
+        self.retry_checkpoint_step_pct_var.set(updated)
+        self._update_retry_checkpoint_step_label()
+        self._save_settings()
+
     def _toggle_include_generated(self) -> None:
         self.include_generated_var.set(not self.include_generated_var.get())
         self._update_include_generated_button_text()
@@ -1051,6 +1118,12 @@ class VideoSorterGUI:
         self.reid_model_tier_var.set(str(data.get("reid_model_tier", "balanced")))
         self.video_io_prefetch_var.set(bool(data.get("video_io_prefetch", False)))
         self.live_trace_var.set(bool(data.get("live_trace", False)))
+        try:
+            retry_step = int(data.get("retry_checkpoint_step_pct", 5))
+        except Exception:
+            retry_step = 5
+        self.retry_checkpoint_step_pct_var.set(retry_step)
+        self._update_retry_checkpoint_step_label()
         self._update_include_generated_button_text()
         self._update_review_mode_button_text()
         self._update_learning_button_text()
@@ -1080,6 +1153,7 @@ class VideoSorterGUI:
             "reid_model_tier": str(self.reid_model_tier_var.get().strip() or "balanced"),
             "video_io_prefetch": self.video_io_prefetch_var.get(),
             "live_trace": self.live_trace_var.get(),
+            "retry_checkpoint_step_pct": int(self.retry_checkpoint_step_pct_var.get()),
             "max_seconds": self.max_seconds_var.get().strip(),
             "sample_every_sec": self.sample_every_var.get().strip(),
             "stabilization_seconds": self.stabilization_var.get().strip(),
@@ -1098,43 +1172,51 @@ class VideoSorterGUI:
             self._update_face_engine_status_text()
             return
 
-        try:
-            command = [
-                sys.executable,
-                str(BACKEND_SCRIPT),
-                "--input-dir",
-                ".",
-                "--output-dir",
-                ".",
-                "--print-runtime-json",
-            ]
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd=str(BACKEND_SCRIPT.parent),
-                check=True,
-            )
-            info = json.loads(completed.stdout.strip())
-            acceleration = info.get("acceleration", "Unknown")
-            reason = info.get("reason", "")
-            device_names = info.get("device_names") or []
-            if device_names:
-                device_text = ", ".join(device_names)
-                self.runtime_var.set(f"Runtime: {acceleration} | {device_text}")
-            else:
-                self.runtime_var.set(f"Runtime: {acceleration} | {reason}")
-            selected_engine = "InsightFace" if self.use_insightface_var.get() else "FaceNet (Legacy)"
-            self._update_face_engine_status_text(selected_engine)
-        except Exception as exc:
-            if isinstance(exc, subprocess.CalledProcessError):
-                detail = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()[-1]
-                self.runtime_var.set(f"Runtime: check failed | {detail}")
-            else:
-                self.runtime_var.set(f"Runtime: check failed ({exc})")
-            self._update_face_engine_status_text()
+        self._runtime_refresh_token += 1
+        token = self._runtime_refresh_token
+        self.runtime_var.set("Runtime: checking in background...")
+        selected_engine = "InsightFace" if self.use_insightface_var.get() else "FaceNet (Legacy)"
+
+        def _worker() -> None:
+            message = "Runtime: check failed"
+            try:
+                command = [
+                    sys.executable,
+                    str(BACKEND_SCRIPT),
+                    "--input-dir",
+                    ".",
+                    "--output-dir",
+                    ".",
+                    "--print-runtime-json",
+                ]
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=str(BACKEND_SCRIPT.parent),
+                    check=True,
+                )
+                info = json.loads(completed.stdout.strip())
+                acceleration = info.get("acceleration", "Unknown")
+                reason = info.get("reason", "")
+                device_names = info.get("device_names") or []
+                if device_names:
+                    device_text = ", ".join(device_names)
+                    message = f"Runtime: {acceleration} | {device_text}"
+                else:
+                    message = f"Runtime: {acceleration} | {reason}"
+            except Exception as exc:
+                if isinstance(exc, subprocess.CalledProcessError):
+                    detail = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()[-1]
+                    message = f"Runtime: check failed | {detail}"
+                else:
+                    message = f"Runtime: check failed ({exc})"
+
+            self.runtime_refresh_queue.put((token, message, selected_engine))
+
+        threading.Thread(target=_worker, daemon=True, name="runtime-refresh").start()
 
     def _parse_numeric_options(self) -> tuple[int, float, float, int, int] | None:
         try:
@@ -1150,6 +1232,13 @@ class VideoSorterGUI:
         if max_seconds <= 0 or sample_every <= 0 or stabilization <= 0 or resize_width <= 0 or max_workers <= 0:
             messagebox.showerror(APP_TITLE, "Numeric options must be greater than zero.")
             return None
+
+        if self.live_trace_var.get() and max_workers > 1:
+            max_workers = 1
+            self.max_workers_var.set("1")
+            self._append_log(
+                "[INFO] Live Preview requires single worker. Auto-set Max Workers to 1 for this run.\n"
+            )
         return max_seconds, sample_every, stabilization, resize_width, max_workers
 
     def _prepare_stop_flag(self) -> None:
@@ -1184,6 +1273,8 @@ class VideoSorterGUI:
             str(resize_width),
             "--max-workers",
             str(max_workers),
+            "--retry-checkpoint-step-pct",
+            str(int(self.retry_checkpoint_step_pct_var.get())),
             "--stop-flag-file",
             str(self.stop_flag_path),
         ]
@@ -1348,6 +1439,22 @@ class VideoSorterGUI:
 
     def _fetch_duplicate_scan(self) -> dict:
         return self._run_backend_json(["--duplicates-scan-json"])
+
+    def _run_backend_json_async(
+        self,
+        extra_args: list[str],
+        on_success: Any,
+        on_error: Any,
+    ) -> None:
+        def _worker() -> None:
+            try:
+                payload = self._run_backend_json(extra_args)
+            except Exception as exc:
+                self.root.after(0, lambda err=exc: on_error(err))
+                return
+            self.root.after(0, lambda data=payload: on_success(data))
+
+        threading.Thread(target=_worker, daemon=True, name="backend-json").start()
 
     def _apply_duplicate_move(self, paths: list[str], action_label: str) -> dict | None:
         if not paths:
@@ -1759,14 +1866,9 @@ class VideoSorterGUI:
             self.learning_stats_window.lift()
             self.learning_stats_window.focus_force()
 
-    def _refresh_identity_tools(self) -> None:
+    def _populate_identity_tools_from_payload(self, payload: dict) -> None:
         tree = self.identity_tree
         if tree is None:
-            return
-        try:
-            payload = self._fetch_identity_state()
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"Failed to load identities:\n{exc}")
             return
         identities = payload.get("identities", [])
         if not isinstance(identities, list):
@@ -1793,16 +1895,33 @@ class VideoSorterGUI:
             )
             self.identity_rows[name] = item
 
+    def _refresh_identity_tools(self) -> None:
+        tree = self.identity_tree
+        if tree is None:
+            return
+
+        self.status_var.set("Loading identity tools...")
+
+        def _on_success(payload: dict) -> None:
+            self._populate_identity_tools_from_payload(payload)
+            self.status_var.set("Identity tools loaded")
+
+        def _on_error(exc: Exception) -> None:
+            self.status_var.set("Failed to load identity tools")
+            messagebox.showerror(APP_TITLE, f"Failed to load identities:\n{exc}")
+
+        self._run_backend_json_async(["--identity-list-json"], _on_success, _on_error)
+
     def _open_identity_tools(self) -> None:
         if self.process is not None:
             messagebox.showinfo(APP_TITLE, "Please wait until sorting finishes.")
             return
         self._build_identity_window()
-        self._refresh_identity_tools()
         if self.identity_window is not None:
             self.identity_window.deiconify()
             self.identity_window.lift()
             self.identity_window.focus_force()
+        self._refresh_identity_tools()
 
     def _apply_identity_action(self, args: list[str], action_name: str) -> dict | None:
         try:
@@ -1834,28 +1953,100 @@ class VideoSorterGUI:
 
     def _identity_merge(self) -> None:
         selected = self._selected_identity_names()
-        if len(selected) != 2:
-            messagebox.showinfo(APP_TITLE, "Select exactly two identity folders: source then target.")
+        if len(selected) < 2:
+            messagebox.showinfo(APP_TITLE, "Select at least two identity folders to merge.")
             return
-        source, target = selected[0], selected[1]
-        if source == target:
-            messagebox.showerror(APP_TITLE, "Source and target folders must be different.")
+
+        default_target = selected[0]
+        target = simpledialog.askstring(
+            APP_TITLE,
+            "Target folder name (all other selected folders will merge into this target):",
+            initialvalue=default_target,
+        )
+        if target is None:
             return
+        target = target.strip()
+        if not target:
+            messagebox.showerror(APP_TITLE, "Target folder name is required.")
+            return
+        if target not in self.identity_rows:
+            messagebox.showerror(APP_TITLE, f"Target folder not found in identities: {target}")
+            return
+
+        sources = [name for name in selected if name.lower() != target.lower()]
+        if not sources:
+            messagebox.showerror(APP_TITLE, "Select at least one source folder different from target.")
+            return
+
+        preview_list = "\n".join(f"- {name}" for name in sources[:10])
+        if len(sources) > 10:
+            preview_list += f"\n... (+{len(sources) - 10} more)"
         if not messagebox.askyesno(
             APP_TITLE,
-            f"Merge all videos from '{source}' into '{target}'?\n\nThis also updates learning memory labels.",
+            "Merge selected folders into target?\n\n"
+            f"Target: {target}\n"
+            f"Sources ({len(sources)}):\n{preview_list}\n\n"
+            "This also updates learning memory labels.",
         ):
             return
-        self._apply_identity_action(
-            [
+
+        merged_ok = 0
+        merged_failed = 0
+        total_moved = 0
+        total_learning_events = 0
+        total_learning_with_embeddings = 0
+
+        for source in sources:
+            args = [
                 "--identity-action",
                 "merge",
                 "--identity-source-folder",
                 source,
                 "--identity-target-folder",
                 target,
-            ],
-            "merge",
+            ]
+            try:
+                payload = self._run_backend_json(args)
+            except Exception as exc:
+                merged_failed += 1
+                self._append_log(f"[IDENTITY] merge {source} -> {target} failed: {exc}\n")
+                continue
+
+            if not bool(payload.get("ok", False)):
+                merged_failed += 1
+                self._append_log(
+                    f"[IDENTITY] merge {source} -> {target} failed: {payload.get('error', payload)}\n"
+                )
+                continue
+
+            details = payload.get("details", {})
+            moved_count = int(details.get("moved_count", 0) or 0) if isinstance(details, dict) else 0
+            learning_events = int(details.get("learning_feedback_events", 0) or 0) if isinstance(details, dict) else 0
+            learning_with_embeddings = (
+                int(details.get("learning_feedback_with_embeddings", 0) or 0) if isinstance(details, dict) else 0
+            )
+            total_moved += moved_count
+            total_learning_events += learning_events
+            total_learning_with_embeddings += learning_with_embeddings
+            merged_ok += 1
+
+            self._append_log(
+                f"[IDENTITY] merge {source} -> {target}: moved={moved_count} "
+                f"learning_events={learning_events} with_embeddings={learning_with_embeddings}\n"
+            )
+
+        self._refresh_identity_tools()
+        self._refresh_learning_stats()
+        self._refresh_review_queue_status()
+
+        messagebox.showinfo(
+            APP_TITLE,
+            "Merge complete.\n\n"
+            f"Successful: {merged_ok}\n"
+            f"Failed: {merged_failed}\n"
+            f"Videos moved: {total_moved}\n"
+            f"Learning events: {total_learning_events}\n"
+            f"Learning events with embeddings: {total_learning_with_embeddings}",
         )
 
     def _identity_lock(self) -> None:
@@ -2110,14 +2301,35 @@ class VideoSorterGUI:
         if self.review_window is not None and self.review_window.winfo_exists():
             self.review_window.destroy()
         self.review_window = None
+        self.review_preview_label = None
         self.review_preview_image = None
+
+    def _safe_review_label_configure(self, **kwargs: Any) -> bool:
+        label = getattr(self, "review_preview_label", None)
+        if label is None:
+            return False
+        try:
+            if not bool(label.winfo_exists()):
+                return False
+        except Exception:
+            return False
+        try:
+            label.configure(**kwargs)
+            return True
+        except tk.TclError:
+            return False
 
     def _load_review_preview(self, video_path: Path) -> None:
         label = getattr(self, "review_preview_label", None)
         if label is None:
             return
+        try:
+            if not bool(label.winfo_exists()):
+                return
+        except Exception:
+            return
         if not video_path.exists():
-            label.configure(text="Video not found", image="")
+            self._safe_review_label_configure(text="Video not found", image="")
             self.review_preview_image = None
             return
 
@@ -2138,7 +2350,7 @@ class VideoSorterGUI:
             cap.release()
 
         if frame is None:
-            label.configure(text="Preview unavailable", image="")
+            self._safe_review_label_configure(text="Preview unavailable", image="")
             self.review_preview_image = None
             return
 
@@ -2146,7 +2358,9 @@ class VideoSorterGUI:
         image = Image.fromarray(frame_rgb)
         image.thumbnail((760, 420))
         photo = ImageTk.PhotoImage(image=image)
-        label.configure(image=photo, text="")
+        if not self._safe_review_label_configure(image=photo, text=""):
+            self.review_preview_image = None
+            return
         self.review_preview_image = photo
         label.image = photo
 
@@ -2162,7 +2376,7 @@ class VideoSorterGUI:
             self.review_path_var.set("")
             label = getattr(self, "review_preview_label", None)
             if label is not None:
-                label.configure(text="No pending items", image="")
+                self._safe_review_label_configure(text="No pending items", image="")
             self.review_preview_image = None
             return
 
@@ -2188,34 +2402,55 @@ class VideoSorterGUI:
         self.review_path_var.set(str(pending_path))
         self._load_review_preview(pending_path)
 
+    def _load_review_queue_async(self, *, notify_if_empty: bool) -> None:
+        self.status_var.set("Loading review queue...")
+
+        def _on_success(state: dict) -> None:
+            items = state.get("items", [])
+            if not isinstance(items, list):
+                items = []
+            self.review_items = [item for item in items if isinstance(item, dict) and item.get("status") == "pending"]
+            if self.review_index >= len(self.review_items):
+                self.review_index = max(0, len(self.review_items) - 1)
+            self._render_review_item()
+            self._refresh_review_queue_status()
+
+            if not self.review_items:
+                self.status_var.set("No pending review items")
+                if notify_if_empty:
+                    messagebox.showinfo(APP_TITLE, "No pending review items.")
+                if self.review_window is not None and self.review_window.winfo_exists():
+                    self._close_review_window()
+                return
+
+            self.status_var.set("Review queue loaded")
+            if self.review_window is not None and self.review_window.winfo_exists():
+                self.review_window.deiconify()
+                self.review_window.lift()
+                self.review_window.focus_force()
+
+        def _on_error(exc: Exception) -> None:
+            self.status_var.set("Failed to load review queue")
+            messagebox.showerror(APP_TITLE, f"Failed to load review queue:\n{exc}")
+            if self.review_window is not None and self.review_window.winfo_exists():
+                self._close_review_window()
+
+        self._run_backend_json_async(["--review-list-json"], _on_success, _on_error)
+
     def _open_review_queue(self) -> None:
         if self.process is not None:
             messagebox.showinfo(APP_TITLE, "Please wait until sorting finishes.")
             return
 
-        try:
-            state = self._fetch_review_state()
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"Failed to load review queue:\n{exc}")
-            return
-
-        items = state.get("items", [])
-        if not isinstance(items, list):
-            items = []
-        self.review_items = [item for item in items if isinstance(item, dict) and item.get("status") == "pending"]
-
-        if not self.review_items:
-            messagebox.showinfo(APP_TITLE, "No pending review items.")
-            self._refresh_review_queue_status()
-            return
-
         self.review_index = 0
         self._build_review_window()
-        if self.review_window is not None:
+        if self.review_window is not None and self.review_window.winfo_exists():
             self.review_window.deiconify()
             self.review_window.lift()
             self.review_window.focus_force()
+        self.review_items = []
         self._render_review_item()
+        self._load_review_queue_async(notify_if_empty=True)
 
     def _open_current_video(self) -> None:
         item = self._current_review_item()
@@ -2270,21 +2505,7 @@ class VideoSorterGUI:
                     f"feedback_events={info.get('feedback_events', '')}\n"
                 )
 
-        try:
-            state = self._fetch_review_state()
-            items = state.get("items", [])
-            if not isinstance(items, list):
-                items = []
-            self.review_items = [entry for entry in items if isinstance(entry, dict) and entry.get("status") == "pending"]
-            if self.review_index >= len(self.review_items):
-                self.review_index = max(0, len(self.review_items) - 1)
-            self._render_review_item()
-            self._refresh_review_queue_status()
-            if not self.review_items and self.review_window is not None:
-                messagebox.showinfo(APP_TITLE, "Review queue completed.")
-                self._close_review_window()
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"Failed to refresh review queue:\n{exc}")
+        self._load_review_queue_async(notify_if_empty=False)
 
     def _reassign_existing(self) -> None:
         item = self._current_review_item()
@@ -2372,6 +2593,16 @@ class VideoSorterGUI:
         self.log_queue.put("__PROCESS_DONE__")
 
     def _poll_log_queue(self) -> None:
+        while True:
+            try:
+                token, message, selected_engine = self.runtime_refresh_queue.get_nowait()
+            except queue.Empty:
+                break
+            if token != self._runtime_refresh_token:
+                continue
+            self.runtime_var.set(message)
+            self._update_face_engine_status_text(selected_engine)
+
         log_chunks: list[str] = []
         while True:
             try:

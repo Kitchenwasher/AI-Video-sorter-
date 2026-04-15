@@ -26,6 +26,7 @@ class SortedEmbeddingCacheEntry(TypedDict):
     confidence_score: float
     embedding: List[float]
     reid_embedding: List[float]
+    embedding_source: str
     updated_at: str
 
 
@@ -106,6 +107,7 @@ def persist_sorted_embedding_cache(
             "confidence_score": round(clamp_confidence(safe_float(item.get("confidence_score", 0.0))), 4),
             "embedding": embedding,
             "reid_embedding": reid_embedding,
+            "embedding_source": str(item.get("embedding_source", "")),
             "updated_at": now_iso,
         }
         entries[key] = payload

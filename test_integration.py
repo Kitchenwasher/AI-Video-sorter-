@@ -73,6 +73,7 @@ def _make_result(video_path: str, label: str, confidence: float,
     result = new_result_record(video_path, "CPU fallback")
     set_decision(result, label, f"Synthetic: {label}", confidence)
     result["embedding"] = _make_fake_embedding(seed=seed)
+    result["embedding_source"] = "stabilized"
     result["suggested_folder_name"] = folder_name or label
     result["reason_metrics"] = {
         "total_faces_evaluated": 10,
@@ -149,6 +150,7 @@ class EndToEndPipelineTest(unittest.TestCase):
             uncertain_result = _make_result(
                 str(uncertain_vid), "uncertain", 0.55, seed=99
             )
+            uncertain_result["embedding_source"] = "provisional_seed"
             uncertain_result["reason_metrics"]["stable_embeddings"] = 1
             uncertain_result["reason_metrics"]["gender_votes"] = 1
             results.append(uncertain_result)
@@ -179,6 +181,7 @@ class EndToEndPipelineTest(unittest.TestCase):
                 self.assertIn("decision_label", p)
                 self.assertIn("confidence_score", p)
                 self.assertIn("reason_tags", p)
+                self.assertIn("embedding_source", p)
 
             # 4. Generate reports
             from datetime import datetime, timezone, timedelta
@@ -228,6 +231,8 @@ class EndToEndPipelineTest(unittest.TestCase):
                 output_dir / LEARNING_DIRNAME / sorting_embedding_cache_filename(True)
             )
             self.assertGreater(len(cache.get("entries", {})), 0)
+            first_entry = next(iter(cache.get("entries", {}).values()))
+            self.assertIn("embedding_source", first_entry)
 
 
 class ClusteringIntegrationTest(unittest.TestCase):

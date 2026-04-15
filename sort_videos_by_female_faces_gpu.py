@@ -126,6 +126,7 @@ from shared.constants import (
     PROFILE_FAST as PROFILE_FAST,
     PROFILE_HIGH_ACCURACY as PROFILE_HIGH_ACCURACY,
     PROFILE_KEY_TO_FLAG as PROFILE_KEY_TO_FLAG,
+    PREVIEW_WINDOW_TITLE as PREVIEW_WINDOW_TITLE,
     REASON_TAG_PRIORITY as REASON_TAG_PRIORITY,
     REPORTS_DIRNAME as REPORTS_DIRNAME,
     RESULT_JSON_PREFIX as RESULT_JSON_PREFIX,
@@ -237,6 +238,7 @@ class Config:
     use_insightface: bool = USE_INSIGHTFACE
     max_seconds: int = 60
     sample_every_sec: float = 2.0
+    retry_checkpoint_step_pct: int = 5
     scene_change_aware_sampling: bool = True
     scene_change_threshold: float = DEFAULT_SCENE_CHANGE_THRESHOLD
     scene_change_scan_step_sec: float = DEFAULT_SCENE_CHANGE_SCAN_STEP_SEC
@@ -298,6 +300,7 @@ REID_BACKEND_LABEL = "disabled"
 REID_ENABLED = False
 PREVIEW_ENABLED = False
 PREVIEW_WARNED = False
+PREVIEW_WINDOW_READY = False
 SORTING_EMBEDDING_CACHE_FILENAME = "video_embedding_cache.json"
 
 PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
@@ -369,6 +372,7 @@ class SortedEmbeddingCacheEntry(TypedDict):
     confidence_score: float
     embedding: List[float]
     reid_embedding: List[float]
+    embedding_source: str
     updated_at: str
 
 
@@ -385,6 +389,25 @@ def _opencv_gui_available() -> bool:
         if "GUI:" in line:
             return "NONE" not in line.upper()
     return False
+
+
+def _opencv_preview_runtime_check() -> Tuple[bool, str]:
+    """Validate OpenCV HighGUI at runtime (not only build flags)."""
+    probe_window = f"{PREVIEW_WINDOW_TITLE}__probe"
+    try:
+        cv2.namedWindow(probe_window, cv2.WINDOW_NORMAL)
+        probe = np.zeros((64, 128, 3), dtype=np.uint8)
+        cv2.putText(probe, "probe", (8, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.imshow(probe_window, probe)
+        cv2.waitKey(1)
+        cv2.destroyWindow(probe_window)
+        return True, "opencv highgui runtime ok"
+    except Exception as exc:
+        try:
+            cv2.destroyWindow(probe_window)
+        except Exception:
+            pass
+        return False, str(exc)
 
 
 def embedding_model_key(use_insightface: bool) -> str:
@@ -481,11 +504,22 @@ def choose_preferred_device(force_gpu: bool = False) -> Tuple[torch.device, str]
             device_name = "Unknown GPU"
         return torch.device("cuda"), f"GPU use forced by flag on {device_name}"
 
+    try:
+        device_name = torch.cuda.get_device_name(0)
+    except Exception:
+        device_name = "Unknown GPU"
+
     smoke_ok, reason = gpu_smoke_test()
     if smoke_ok:
         return torch.device("cuda"), reason
 
-    return torch.device("cpu"), reason
+    # Prefer trying GPU when torch reports it is visible; downstream loaders already
+    # fallback to CPU on runtime failures. This avoids false CPU-only decisions when
+    # smoke tests fail intermittently in ROCm/DML environments.
+    return (
+        torch.device("cuda"),
+        f"GPU reported available on {device_name}; smoke test warning ignored ({reason})",
+    )
 
 
 def get_runtime_info() -> Dict[str, Any]:
@@ -638,8 +672,10 @@ def init_worker(cfg: Config) -> None:
     global CFG, DEVICE, MTCNN_MODEL, EMBED_MODEL, ACTIVE_ACCELERATION
     global PREVIEW_ENABLED, INSIGHTFACE_ACTIVE, INSIGHTFACE_BACKEND_LABEL
     global REID_BACKEND_LABEL, REID_ENABLED
+    global PREVIEW_WINDOW_READY
     CFG = cfg
     PREVIEW_ENABLED = bool(cfg.live_trace and cfg.max_workers == 1)
+    PREVIEW_WINDOW_READY = False
     INSIGHTFACE_ACTIVE = False
     INSIGHTFACE_BACKEND_LABEL = ""
     REID_BACKEND_LABEL = "disabled"
@@ -656,6 +692,15 @@ def init_worker(cfg: Config) -> None:
             "python -m pip install --upgrade opencv-python",
             flush=True,
         )
+    elif PREVIEW_ENABLED:
+        ok, reason = _opencv_preview_runtime_check()
+        if not ok:
+            PREVIEW_ENABLED = False
+            print(
+                "[WARN] Live preview disabled: OpenCV GUI runtime check failed. "
+                f"Details: {reason}",
+                flush=True,
+            )
 
     preferred_device, preferred_reason = choose_preferred_device(force_gpu=cfg.force_gpu)
     print(f"[INFO] Preferred acceleration: {preferred_device.type} | {preferred_reason}", flush=True)
@@ -681,11 +726,18 @@ def init_worker(cfg: Config) -> None:
         else:
             try:
                 INSIGHTFACE_BACKEND_LABEL = insight_initialize()
-                INSIGHTFACE_ACTIVE = True
-                ACTIVE_ACCELERATION = INSIGHTFACE_BACKEND_LABEL
                 print(f"[INFO] InsightFace initialized: {INSIGHTFACE_BACKEND_LABEL}", flush=True)
                 print(f"[INFO] InsightFace providers: {insight_provider_label()}", flush=True)
-                return
+                if INSIGHTFACE_BACKEND_LABEL.lower().startswith("cpu fallback") and preferred_device.type == "cuda":
+                    print(
+                        "[WARN] InsightFace is running on CPU while torch GPU is available. "
+                        "Switching to FaceNet GPU path for acceleration.",
+                        flush=True,
+                    )
+                else:
+                    INSIGHTFACE_ACTIVE = True
+                    ACTIVE_ACCELERATION = INSIGHTFACE_BACKEND_LABEL
+                    return
             except Exception as exc:
                 print(f"[WARN] InsightFace initialization failed, using FaceNet fallback: {exc}", flush=True)
                 LOGGER.exception("InsightFace init failure", exc_info=exc)
@@ -1601,6 +1653,7 @@ def build_uncertain_retry_checkpoints(
     duration_sec: float,
     initial_scan_end_sec: float,
     require_seed_hits: bool = True,
+    checkpoint_step_pct: int = 5,
 ) -> List[float]:
     if require_seed_hits and seed_hits <= 0:
         return []
@@ -1613,9 +1666,24 @@ def build_uncertain_retry_checkpoints(
     if already_covered_until >= total_duration:
         return []
 
+    step_pct = int(checkpoint_step_pct)
+    if step_pct < 5:
+        step_pct = 5
+    if step_pct > 95:
+        step_pct = 95
+    if step_pct % 5 != 0:
+        step_pct = int(round(step_pct / 5.0) * 5)
+        step_pct = max(5, min(95, step_pct))
+
+    retry_ratios: Tuple[float, ...]
+    if step_pct == 5:
+        retry_ratios = RETRY_CHECKPOINT_RATIOS
+    else:
+        retry_ratios = tuple(step / 100.0 for step in range(step_pct, 100, step_pct))
+
     checkpoints: List[float] = []
     seen: set[float] = set()
-    for ratio in RETRY_CHECKPOINT_RATIOS:
+    for ratio in retry_ratios:
         checkpoint = round(total_duration * float(ratio), 6)
         key = round(checkpoint, 6)
         if checkpoint <= already_covered_until + 1e-6:
@@ -1726,12 +1794,20 @@ def show_live_preview(
     timestamp_sec: float,
     frame_index: int,
 ) -> None:
-    global PREVIEW_ENABLED, PREVIEW_WARNED
+    global PREVIEW_ENABLED, PREVIEW_WARNED, PREVIEW_WINDOW_READY
 
     if CFG is None or not CFG.live_trace or not PREVIEW_ENABLED or frame_bgr is None:
         return
 
     try:
+        if not PREVIEW_WINDOW_READY:
+            cv2.namedWindow(PREVIEW_WINDOW_TITLE, cv2.WINDOW_NORMAL)
+            try:
+                cv2.setWindowProperty(PREVIEW_WINDOW_TITLE, cv2.WND_PROP_TOPMOST, 1)
+            except Exception:
+                pass
+            PREVIEW_WINDOW_READY = True
+            print(f"[INFO] Live preview window opened: {PREVIEW_WINDOW_TITLE}", flush=True)
         preview = frame_bgr.copy()
         overlay = f"{phase} | {video_name} | {timestamp_sec:.2f}s | frame {frame_index}"
         cv2.putText(
@@ -1754,12 +1830,14 @@ def show_live_preview(
 
 
 def close_live_preview() -> None:
+    global PREVIEW_WINDOW_READY
     if not PREVIEW_ENABLED:
         return
     try:
         cv2.destroyWindow(PREVIEW_WINDOW_TITLE)
     except Exception:
         pass
+    PREVIEW_WINDOW_READY = False
     try:
         cv2.destroyAllWindows()
     except Exception:
@@ -2254,6 +2332,7 @@ def new_result_record(video_path: str, device_label: str) -> Dict[str, Any]:
         "video": video_path,
         "female_found": False,
         "embedding": None,
+        "embedding_source": "",
         "error": None,
         "stopped": False,
         "samples_used": 0,
@@ -2430,6 +2509,7 @@ def build_result_json_payload(result: Dict[str, Any]) -> Dict[str, Any]:
         "suggested_cluster_id": result.get("suggested_cluster_id"),
         "samples_used": max(0, _safe_int(result.get("samples_used", 0))),
         "embedding": safe_embedding,
+        "embedding_source": str(result.get("embedding_source", "")),
         "reid_enabled": bool(result.get("reid_enabled", False)),
         "reid_embedding_present": bool(safe_reid_embedding),
         "reid_backend": str(result.get("reid_backend", "")),
@@ -2538,6 +2618,7 @@ def persist_sorted_embedding_cache(
             "confidence_score": round(clamp_confidence(_safe_float(item.get("confidence_score", 0.0))), 4),
             "embedding": embedding,
             "reid_embedding": reid_embedding,
+            "embedding_source": str(item.get("embedding_source", "")),
             "updated_at": now_iso,
         }
         entries[key] = payload
@@ -2874,6 +2955,7 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
         result["suggested_folder_name"] = label
         result["female_found"] = False
         result["suggested_cluster_id"] = None
+        uncertain_confidence = max(float(cfg.learning_suggest_threshold), min(float(score), float(adaptive_auto_threshold)))
         set_decision(
             result,
             "uncertain",
@@ -2881,7 +2963,7 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Con
                 f"Memory suggests {label} (score={score:.3f}) but confidence is below "
                 f"adaptive auto-apply threshold ({adaptive_auto_threshold:.3f})."
             ),
-            max(base_conf, min(0.8, score)),
+            uncertain_confidence,
         )
 
 
@@ -2966,6 +3048,30 @@ def update_learning_from_review_item(
     return True
 
 
+def _apply_provisional_embedding_if_missing(
+    result: Dict[str, Any],
+    provisional_embedding: Optional[np.ndarray],
+) -> bool:
+    """Backfill uncertain result embedding from verified seed/retry candidate."""
+    if str(result.get("decision_label", "")).strip().lower() != "uncertain":
+        return False
+    if result.get("embedding") is not None:
+        return False
+    if provisional_embedding is None:
+        return False
+    arr = np.asarray(provisional_embedding, dtype=np.float32).reshape(-1)
+    if arr.size == 0 or not np.isfinite(arr).all():
+        return False
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-8:
+        return False
+    normalized = (arr / norm).astype(np.float32)
+    result["embedding"] = normalized.tolist()
+    result["samples_used"] = max(1, int(result.get("samples_used", 0) or 0))
+    result["embedding_source"] = "provisional_seed"
+    return True
+
+
 def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] = None) -> Dict[str, Any]:
     assert CFG is not None
     cfg = CFG
@@ -3007,6 +3113,9 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
             cfg,
             video_name,
         )
+        provisional_seed_embedding: Optional[np.ndarray] = None
+        if has_verified_female_candidate(first_ts, first_box, first_embedding, first_gender_label, first_gender_conf):
+            provisional_seed_embedding = np.asarray(first_embedding, dtype=np.float32).reshape(-1).copy()
         scan_info = merge_scan_info(empty_scan_info(), scan_info)
         seed_hits = int(scan_info.get("female_seed_hits", 0))
         retry_duration_scope = duration_sec if cfg.reprocess_uncertain_only else scan_duration
@@ -3015,6 +3124,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
             duration_sec=retry_duration_scope,
             initial_scan_end_sec=scan_duration,
             require_seed_hits=not cfg.reprocess_uncertain_only,
+            checkpoint_step_pct=int(cfg.retry_checkpoint_step_pct),
         )
 
         def sync_seed_metrics() -> None:
@@ -3025,9 +3135,16 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
             reason_metrics_inner["low_face_area_rejections"] = int(scan_info.get("low_face_area_rejections", 0))
             result["reason_metrics"] = reason_metrics_inner
 
+        def finalize_uncertain_with_optional_provisional() -> None:
+            if _apply_provisional_embedding_if_missing(result, provisional_seed_embedding):
+                print(
+                    f"[LEARNING] {video_name} saved provisional seed embedding for uncertain result.",
+                    flush=True,
+                )
+
         def recover_seed_from_retry(reason: str) -> bool:
             nonlocal first_ts, first_box, first_embedding, first_gender_label, first_gender_conf
-            nonlocal active_scan_end, scan_info, remaining_retry_checkpoints
+            nonlocal active_scan_end, scan_info, remaining_retry_checkpoints, provisional_seed_embedding
             if not remaining_retry_checkpoints:
                 return False
             print(
@@ -3068,6 +3185,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                 first_ts = retry_ts
                 first_box = retry_box
                 first_embedding = retry_embedding
+                provisional_seed_embedding = np.asarray(retry_embedding, dtype=np.float32).reshape(-1).copy()
                 first_gender_label = retry_gender_label
                 first_gender_conf = retry_gender_conf
                 if retry_scan_end is not None:
@@ -3095,6 +3213,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                     f"(seed_hits={seed_hits}, best_seed_conf={best_seed_conf:.3f})",
                     flush=True,
                 )
+                finalize_uncertain_with_optional_provisional()
             else:
                 set_decision(result, "no_female", "No meaningful female candidate evidence detected.", 0.9)
                 print(f"[NO FEMALE] {video_name}", flush=True)
@@ -3156,6 +3275,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                 f"frames={redetected_frames}, ensemble_conf={subject_gender_confidence:.3f})",
                 flush=True,
             )
+            finalize_uncertain_with_optional_provisional()
             return result
 
         first_gender_label = subject_gender_label
@@ -3193,6 +3313,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                     continue
                 set_decision(result, "uncertain", "Female candidate detected but identity could not be stabilized.", 0.4)
                 print(f"[UNCERTAIN] {video_name} no stable identity", flush=True)
+                finalize_uncertain_with_optional_provisional()
                 return result
 
             if len(kept_embeddings) < cfg.min_stable_embeddings:
@@ -3207,6 +3328,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                     0.45,
                 )
                 print(f"[UNCERTAIN] {video_name} only {len(kept_embeddings)} stable embeddings", flush=True)
+                finalize_uncertain_with_optional_provisional()
                 return result
 
             if gender_votes < cfg.min_stabilization_gender_votes:
@@ -3221,6 +3343,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                     0.45,
                 )
                 print(f"[UNCERTAIN] {video_name} only {gender_votes} gender votes during stabilization", flush=True)
+                finalize_uncertain_with_optional_provisional()
                 return result
 
             total_gender_score = female_score + male_score
@@ -3234,6 +3357,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                         continue
                     stable_embedding = robust_average_embeddings(kept_embeddings)
                     result["embedding"] = stable_embedding.tolist()
+                    result["embedding_source"] = "stabilized"
                     result["samples_used"] = len(kept_embeddings)
                     attach_reid_to_result(result, representative_face_bgr, cfg)
                     set_decision(
@@ -3256,6 +3380,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
 
             result["female_found"] = True
             result["embedding"] = stable_embedding.tolist()
+            result["embedding_source"] = "stabilized"
             result["samples_used"] = len(kept_embeddings)
             attach_reid_to_result(result, representative_face_bgr, cfg)
             set_decision(
@@ -3616,6 +3741,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-seconds", type=int, default=60, help="Only analyze the first N seconds")
     parser.add_argument("--sample-every-sec", type=float, default=2.0, help="Sparse scan interval in seconds")
+    parser.add_argument(
+        "--retry-checkpoint-step-pct",
+        type=int,
+        default=5,
+        choices=range(5, 100, 5),
+        metavar="{5,10,...,95}",
+        help="Retry checkpoint step percentage for uncertain reprocess scans.",
+    )
     parser.add_argument(
         "--scene-change-aware-sampling",
         dest="scene_change_aware_sampling",
@@ -4065,6 +4198,7 @@ def main() -> int:
         use_insightface=bool(args.use_insightface),
         max_seconds=args.max_seconds,
         sample_every_sec=args.sample_every_sec,
+        retry_checkpoint_step_pct=int(args.retry_checkpoint_step_pct),
         scene_change_aware_sampling=bool(args.scene_change_aware_sampling),
         scene_change_threshold=max(0.0, float(args.scene_change_threshold)),
         scene_change_scan_step_sec=max(0.1, float(args.scene_change_scan_step_sec)),
@@ -4123,6 +4257,7 @@ def main() -> int:
     cfg.reid_fusion_weight = max(0.0, min(1.0, float(cfg.reid_fusion_weight)))
     cfg.reid_ambiguity_margin_low = max(0.0, float(cfg.reid_ambiguity_margin_low))
     cfg.reid_ambiguity_margin_high = max(0.0, float(cfg.reid_ambiguity_margin_high))
+    cfg.retry_checkpoint_step_pct = int(max(5, min(95, int(cfg.retry_checkpoint_step_pct))))
 
     print_gpu_status()
 
@@ -4145,6 +4280,7 @@ def main() -> int:
     print(f"Reprocess uncertain only: {cfg.reprocess_uncertain_only}")
     if cfg.reprocess_uncertain_only:
         print(f"Uncertain bucket: {output_dir / UNCERTAIN_DIRNAME}")
+        print(f"Retry checkpoint step: {cfg.retry_checkpoint_step_pct}%")
     print(f"Recursive child-folder scan: {cfg.recursive}")
     print(f"Include generated folders: {cfg.include_generated_folders}")
     print(f"Review mode: {cfg.review_mode}")
@@ -4502,6 +4638,8 @@ def main() -> int:
     moved_count = 0
     queued_count = 0
     memory_applied_count = 0
+    uncertain_with_provisional_embedding = 0
+    uncertain_without_any_embedding = 0
     queue_items: List[Dict[str, Any]] = []
     no_female_dir = output_dir / "No_Female_Found"
     uncertain_dir = output_dir / UNCERTAIN_DIRNAME
@@ -4522,6 +4660,12 @@ def main() -> int:
 
         if decision_label == "uncertain":
             uncertain_count += 1
+            emb_vec = _safe_embedding_vector(item.get("embedding"))
+            emb_source = str(item.get("embedding_source", "")).strip().lower()
+            if emb_vec is not None and emb_source == "provisional_seed":
+                uncertain_with_provisional_embedding += 1
+            elif emb_vec is None:
+                uncertain_without_any_embedding += 1
             moved_path = move_video(src, uncertain_dir)
             item["final_destination"] = str(moved_path)
             if moved_path != src:
@@ -4666,6 +4810,8 @@ def main() -> int:
     print(f"No female found: {no_female_count}")
     print(f"Queued for review: {queued_count}")
     print(f"Memory auto-applied: {memory_applied_count}")
+    print(f"Uncertain with provisional embedding: {uncertain_with_provisional_embedding}")
+    print(f"Uncertain without embedding: {uncertain_without_any_embedding}")
     print(f"Moved videos: {moved_count}")
     print(f"Videos left in source: {max(0, len(videos) - moved_count)}")
     if cfg.reprocess_uncertain_only:

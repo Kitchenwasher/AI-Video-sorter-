@@ -2,7 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from sort_videos_by_female_faces_gpu import (
+    _apply_provisional_embedding_if_missing,
     UNCERTAIN_DIRNAME,
     Config,
     build_uncertain_retry_checkpoints,
@@ -78,6 +81,15 @@ class UncertainReprocessTests(unittest.TestCase):
         )
         self.assertEqual(checkpoints, [55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0])
 
+    def test_retry_checkpoints_respect_custom_step(self) -> None:
+        checkpoints = build_uncertain_retry_checkpoints(
+            seed_hits=3,
+            duration_sec=100.0,
+            initial_scan_end_sec=20.0,
+            checkpoint_step_pct=10,
+        )
+        self.assertEqual(checkpoints, [30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0])
+
     def test_retry_sequence_stops_after_first_success(self) -> None:
         calls: list[tuple[float, float]] = []
         cfg = Config(input_dir=".", output_dir=".")
@@ -148,6 +160,32 @@ class UncertainReprocessTests(unittest.TestCase):
         self.assertEqual(scan_info["total_faces_evaluated"], 13)
         self.assertEqual(scan_info["low_face_area_rejections"], 3)
         self.assertEqual(scan_info["best_seed_confidence"], 0.91)
+
+    def test_provisional_embedding_applied_for_uncertain_with_missing_embedding(self) -> None:
+        result = {
+            "decision_label": "uncertain",
+            "embedding": None,
+            "samples_used": 0,
+            "embedding_source": "",
+        }
+        provisional = np.asarray([0.5, 0.5, 0.5], dtype=np.float32)
+        applied = _apply_provisional_embedding_if_missing(result, provisional)
+        self.assertTrue(applied)
+        self.assertIsInstance(result.get("embedding"), list)
+        self.assertEqual(int(result.get("samples_used", 0)), 1)
+        self.assertEqual(str(result.get("embedding_source", "")), "provisional_seed")
+
+    def test_provisional_embedding_not_applied_when_decision_not_uncertain(self) -> None:
+        result = {
+            "decision_label": "female_detected",
+            "embedding": None,
+            "samples_used": 0,
+            "embedding_source": "",
+        }
+        provisional = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+        applied = _apply_provisional_embedding_if_missing(result, provisional)
+        self.assertFalse(applied)
+        self.assertIsNone(result.get("embedding"))
 
 
 if __name__ == "__main__":

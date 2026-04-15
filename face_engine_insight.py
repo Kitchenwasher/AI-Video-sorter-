@@ -175,14 +175,40 @@ def _preferred_providers() -> List[str]:
     if ort is None:
         return ["CPUExecutionProvider"]
     available = set(ort.get_available_providers() or [])
-    for gpu_provider in ("DmlExecutionProvider", "ROCMExecutionProvider", "CUDAExecutionProvider"):
+    for gpu_provider in (
+        "VitisAIExecutionProvider",
+        "DmlExecutionProvider",
+        "ROCMExecutionProvider",
+        "CUDAExecutionProvider",
+    ):
         if gpu_provider in available:
             return [gpu_provider, "CPUExecutionProvider"]
     return ["CPUExecutionProvider"]
 
 
+def _provider_candidate_orders() -> List[List[str]]:
+    """Return provider orders to try, GPU-first then CPU-only fallback."""
+    if ort is None:
+        return [["CPUExecutionProvider"]]
+
+    available = set(ort.get_available_providers() or [])
+    candidates: List[List[str]] = []
+    for gpu_provider in (
+        "VitisAIExecutionProvider",
+        "DmlExecutionProvider",
+        "ROCMExecutionProvider",
+        "CUDAExecutionProvider",
+    ):
+        if gpu_provider in available:
+            candidates.append([gpu_provider, "CPUExecutionProvider"])
+    candidates.append(["CPUExecutionProvider"])
+    return candidates
+
+
 def _provider_label(providers: Sequence[str]) -> str:
     first = str(providers[0]) if providers else "CPUExecutionProvider"
+    if first == "VitisAIExecutionProvider":
+        return "NPU via AMD Ryzen AI (Vitis AI)"
     if first == "DmlExecutionProvider":
         return "GPU via DirectML (InsightFace)"
     if first == "ROCMExecutionProvider":
@@ -209,28 +235,22 @@ def initialize_insightface() -> str:
         if _APP is not None:
             return _APP_CONTEXT_LABEL
 
-        providers = _preferred_providers()
-        app = FaceAnalysis(name="buffalo_l", providers=providers)
-        _APP_PROVIDER_LABEL = ",".join(providers)
-        ctx_id = 0 if providers and providers[0] != "CPUExecutionProvider" else -1
+        errors: List[str] = []
+        for providers in _provider_candidate_orders():
+            app = FaceAnalysis(name="buffalo_l", providers=providers)
+            ctx_id = 0 if providers and providers[0] != "CPUExecutionProvider" else -1
+            try:
+                app.prepare(ctx_id=ctx_id, det_size=_DET_SIZE)
+                _APP = app
+                _APP_PROVIDER_LABEL = ",".join(providers)
+                _APP_CONTEXT_LABEL = _provider_label(providers)
+                return _APP_CONTEXT_LABEL
+            except Exception as provider_exc:
+                errors.append(f"{providers}: {provider_exc}")
+                logger.warning("InsightFace init with providers=%s failed: %s", providers, provider_exc)
 
-        try:
-            app.prepare(ctx_id=ctx_id, det_size=_DET_SIZE)
-            _APP = app
-            _APP_CONTEXT_LABEL = _provider_label(providers)
-            return _APP_CONTEXT_LABEL
-        except Exception as gpu_exc:
-            logger.warning("InsightFace init with providers=%s failed, falling back to CPU: %s", providers, gpu_exc)
-
-        try:
-            app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-            app.prepare(ctx_id=-1, det_size=_DET_SIZE)
-            _APP = app
-            _APP_CONTEXT_LABEL = "CPU fallback (InsightFace)"
-            _APP_PROVIDER_LABEL = "CPUExecutionProvider"
-            return _APP_CONTEXT_LABEL
-        except Exception as cpu_exc:
-            raise RuntimeError(f"InsightFace init failed on GPU and CPU: {cpu_exc}") from cpu_exc
+        joined = " | ".join(errors) if errors else "unknown error"
+        raise RuntimeError(f"InsightFace init failed across all providers: {joined}")
 
 
 def _clamp_bbox(bbox: Sequence[float], width: int, height: int) -> Optional[Tuple[int, int, int, int]]:

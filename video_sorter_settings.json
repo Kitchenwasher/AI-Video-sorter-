@@ -1,16 +1,20 @@
 {
-  "source_folder": "D:/New folder",
+  "source_folder": "D:/sorted",
   "destination_folder": "D:/temp sorted",
   "recursive": true,
   "include_generated_folders": true,
   "review_mode": true,
   "learning_enabled": true,
   "use_insightface": true,
+  "cross_video_reid": true,
+  "reid_model_tier": "balanced",
+  "video_io_prefetch": true,
   "live_trace": false,
+  "retry_checkpoint_step_pct": 20,
   "max_seconds": "90",
   "sample_every_sec": "1.0",
   "stabilization_seconds": "10.0",
   "resize_width": "1152",
-  "max_workers": "1",
+  "max_workers": "2",
   "profile": "high_accuracy"
 }

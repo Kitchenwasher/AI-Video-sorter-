@@ -100,6 +100,28 @@ class MemoryAssistTests(unittest.TestCase):
         self.assertFalse(result["female_found"])
         self.assertIsNone(result["suggested_cluster_id"])
 
+    def test_memory_suggest_uncertain_confidence_does_not_reuse_high_base_confidence(self) -> None:
+        cfg = self._cfg()
+        memory = {
+            "identities": [
+                {"label": "Female_MemoryOnly", "prototype": [1.0, 0.0, 0.0], "sample_count": 1, "confidence_sum": 1.0}
+            ]
+        }
+        result = {
+            "decision_label": "female_detected",
+            "decision_reason": "native model high confidence",
+            "confidence_score": 0.989,
+            "embedding": [0.76, 0.65, 0.0],  # suggest-level but below auto threshold
+            "female_found": True,
+            "suggested_folder_name": "",
+            "suggested_cluster_id": 5,
+        }
+
+        apply_memory_assist(result, memory, cfg)
+        self.assertEqual(result["decision_label"], "uncertain")
+        self.assertLess(float(result["confidence_score"]), 0.9)
+        self.assertGreaterEqual(float(result["confidence_score"]), cfg.learning_suggest_threshold)
+
     def test_locked_identity_forces_auto_apply_at_threshold(self) -> None:
         cfg = self._cfg()
         memory = {

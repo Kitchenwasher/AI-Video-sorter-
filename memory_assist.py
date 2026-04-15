@@ -120,6 +120,7 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Any
         result["suggested_folder_name"] = label
         result["female_found"] = False
         result["suggested_cluster_id"] = None
+        uncertain_confidence = max(float(cfg.learning_suggest_threshold), min(float(score), float(adaptive_auto_threshold)))
         set_decision(
             result,
             "uncertain",
@@ -127,7 +128,7 @@ def apply_memory_assist(result: Dict[str, Any], memory: Dict[str, Any], cfg: Any
                 f"Memory suggests {label} (score={score:.3f}) but confidence is below "
                 f"adaptive auto-apply threshold ({adaptive_auto_threshold:.3f})."
             ),
-            max(base_conf, min(0.8, score)),
+            uncertain_confidence,
         )
 
 

@@ -69,8 +69,10 @@ class ExplainabilityTests(unittest.TestCase):
         self.assertIn("reason_summary", payload)
         self.assertIn("reason_tags", payload)
         self.assertIn("reason_metrics", payload)
+        self.assertIn("embedding_source", payload)
         self.assertEqual(payload["video_name"], "c.mp4")
         self.assertEqual(payload["confidence_score"], 0.877)
+        self.assertEqual(payload["embedding_source"], "")
         self.assertIsInstance(payload["reason_tags"], list)
         self.assertIsInstance(payload["reason_metrics"], dict)
 
