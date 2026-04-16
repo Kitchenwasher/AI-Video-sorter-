@@ -1258,6 +1258,7 @@ class VideoSorterGUI:
         assert self.stop_flag_path is not None
         command = [
             sys.executable,
+            "-u",
             str(BACKEND_SCRIPT),
             "--output-dir",
             str(destination.resolve()),
@@ -1385,6 +1386,7 @@ class VideoSorterGUI:
         destination = Path(destination_text).expanduser().resolve()
         command = [
             sys.executable,
+            "-u",
             str(BACKEND_SCRIPT),
             "--output-dir",
             str(destination),
@@ -1403,6 +1405,7 @@ class VideoSorterGUI:
             encoding="utf-8",
             errors="replace",
             cwd=str(BACKEND_SCRIPT.parent),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
             check=False,
         )
         stdout = (completed.stdout or "").strip()

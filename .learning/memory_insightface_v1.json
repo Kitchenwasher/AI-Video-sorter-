@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-04-15T17:17:59+00:00",
+  "updated_at": "2026-04-16T11:33:47+00:00",
   "identities": [
     {
       "label": "Female_Rae",
@@ -1903,11 +1903,11 @@
       "reid_same_person_threshold": null,
       "correction_consistency_score": 0.0,
       "adaptive_auto_threshold": 0.82,
-      "same_person_threshold": 0.7409340590238571,
+      "same_person_threshold": 0.7409340441226959,
       "intra_distance_mean": 0.4529167115688324,
-      "intra_distance_std": 0.09692538529634476,
+      "intra_distance_std": 0.09692537784576416,
       "intra_distance_pair_count": 6,
-      "same_person_threshold_updated_at": "2026-04-15T17:17:59+00:00"
+      "same_person_threshold_updated_at": "2026-04-16T11:33:47+00:00"
     }
   ],
   "decisions": [

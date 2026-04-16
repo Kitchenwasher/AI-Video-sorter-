@@ -11,10 +11,10 @@
   "video_io_prefetch": true,
   "live_trace": false,
   "retry_checkpoint_step_pct": 20,
-  "max_seconds": "90",
-  "sample_every_sec": "1.0",
-  "stabilization_seconds": "10.0",
-  "resize_width": "1152",
+  "max_seconds": "60",
+  "sample_every_sec": "2.0",
+  "stabilization_seconds": "8.0",
+  "resize_width": "960",
   "max_workers": "2",
-  "profile": "high_accuracy"
+  "profile": "balanced"
 }

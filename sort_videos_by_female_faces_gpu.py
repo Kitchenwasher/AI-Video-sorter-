@@ -216,6 +216,7 @@ DEFAULT_SCENE_DENSE_WINDOW_SEC = 1.0
 DEFAULT_SCENE_DENSE_STEP_SEC = 0.5
 DEFAULT_SCENE_STATIC_STD_THRESHOLD = 8.0
 DEFAULT_SCENE_STATIC_LAPLACIAN_THRESHOLD = 20.0
+DEFAULT_EXTENDED_SCAN_START_RATIOS: Tuple[float, ...] = (0.35, 0.60, 0.80)
 
 
 @dataclass
@@ -3197,6 +3198,66 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
             recover_seed_from_retry("no verified seed in initial scan")
 
         sync_seed_metrics()
+
+        if not has_verified_female_candidate(first_ts, first_box, first_embedding, first_gender_label, first_gender_conf):
+            # Safety net: if the first scan window has no verified female, probe later
+            # windows too so long videos do not get misrouted to No_Female_Found too early.
+            if duration_sec > (scan_duration + max(10.0, cfg.sample_every_sec * 2.0)):
+                window_len = max(15.0, float(scan_duration))
+                seen_starts: set[int] = set()
+                for ratio in DEFAULT_EXTENDED_SCAN_START_RATIOS:
+                    late_start = max(0.0, float(duration_sec) * float(ratio))
+                    # Keep full window inside video bounds.
+                    if late_start + 1.0 >= duration_sec:
+                        continue
+                    late_end = min(float(duration_sec), late_start + window_len)
+                    if late_end <= late_start + 1.0:
+                        continue
+                    start_key = int(round(late_start * 10.0))
+                    if start_key in seen_starts:
+                        continue
+                    seen_starts.add(start_key)
+                    print(
+                        f"[EXTSCAN] {video_name} scanning late window {late_start:.1f}s -> {late_end:.1f}s",
+                        flush=True,
+                    )
+                    (
+                        late_ts,
+                        late_box,
+                        late_embedding,
+                        late_gender_label,
+                        late_gender_conf,
+                        late_scan_info,
+                    ) = find_first_female(
+                        cap=cap,
+                        fps=fps,
+                        total_frames=total_frames,
+                        scan_duration=late_end,
+                        cfg=cfg,
+                        video_name=video_name,
+                        scan_start_sec=late_start,
+                    )
+                    scan_info = merge_scan_info(scan_info, late_scan_info)
+                    sync_seed_metrics()
+                    if has_verified_female_candidate(
+                        late_ts,
+                        late_box,
+                        late_embedding,
+                        late_gender_label,
+                        late_gender_conf,
+                    ):
+                        first_ts = late_ts
+                        first_box = late_box
+                        first_embedding = late_embedding
+                        first_gender_label = late_gender_label
+                        first_gender_conf = late_gender_conf
+                        active_scan_end = late_end
+                        provisional_seed_embedding = np.asarray(late_embedding, dtype=np.float32).reshape(-1).copy()
+                        print(
+                            f"[EXTSCAN] {video_name} recovered verified female at {late_ts:.1f}s",
+                            flush=True,
+                        )
+                        break
 
         if not has_verified_female_candidate(first_ts, first_box, first_embedding, first_gender_label, first_gender_conf):
             seed_hits = int(scan_info.get("female_seed_hits", 0))
