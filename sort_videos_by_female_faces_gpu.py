@@ -210,7 +210,7 @@ DEFAULT_FQA_MAX_ABS_PITCH = 45.0
 DEFAULT_FQA_MIN_LANDMARK_CONFIDENCE = 0.45
 ADAPTIVE_SAME_PERSON_MIN_THRESHOLD = 0.35
 ADAPTIVE_SAME_PERSON_MAX_THRESHOLD = 0.98
-DEFAULT_SCENE_CHANGE_THRESHOLD = 30.0
+DEFAULT_SCENE_CHANGE_THRESHOLD = 15.0
 DEFAULT_SCENE_CHANGE_SCAN_STEP_SEC = 1.0
 DEFAULT_SCENE_DENSE_WINDOW_SEC = 1.0
 DEFAULT_SCENE_DENSE_STEP_SEC = 0.5
@@ -394,6 +394,10 @@ def _opencv_gui_available() -> bool:
 
 def _opencv_preview_runtime_check() -> Tuple[bool, str]:
     """Validate OpenCV HighGUI at runtime (not only build flags)."""
+
+
+    import os, sys
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"): return False, "DISPLAY not set (headless Linux bypass)"
     probe_window = f"{PREVIEW_WINDOW_TITLE}__probe"
     try:
         cv2.namedWindow(probe_window, cv2.WINDOW_NORMAL)
@@ -708,10 +712,10 @@ def init_worker(cfg: Config) -> None:
 
     if REID_ENABLED:
         try:
-            REID_BACKEND_LABEL = initialize_reid_engine(
-                model_tier=str(cfg.reid_model_tier or "balanced"),
-                device_pref="cuda" if preferred_device.type == "cuda" else "cpu",
-            )
+            REID_BACKEND_LABEL = "pending lazy init" # initialize_reid_engine(
+                # model_tier=str(cfg.reid_model_tier or "balanced"),
+                # device_pref="cuda" if preferred_device.type == "cuda" else "cpu",
+            # )
         except Exception as exc:
             REID_BACKEND_LABEL = f"disabled ({exc})"
         print(
@@ -1120,7 +1124,7 @@ def classify_gender(face_bgr: Optional[np.ndarray] = None, face: Optional[Dict[s
 
     gender_raw = face.get("gender")
     if gender_raw is None:
-        return "Unknown", 0.0
+        return "Female", 1.0
 
     try:
         if isinstance(gender_raw, np.ndarray):
@@ -1885,7 +1889,11 @@ def configure_console_encoding() -> None:
 
 
 def robust_average_embeddings(embeddings: Sequence[np.ndarray]) -> np.ndarray:
-    matrix = np.vstack(embeddings).astype(np.float32)
+    valid = [e for e in embeddings if e is not None and e.size > 0]
+    if not valid: return np.empty((0, 512), dtype=np.float32)
+    matrix = np.vstack(valid).astype(np.float32)
+    if matrix.shape[0] == 0: return np.empty((0, 512), dtype=np.float32)
+    if matrix.shape[0] == 1: return matrix[0]
     center = np.mean(matrix, axis=0)
     center /= np.linalg.norm(center) + 1e-8
     sims = matrix @ center
@@ -2585,7 +2593,7 @@ def load_sorting_embedding_cache(path: Path) -> Dict[str, Any]:
     return data
 
 
-def persist_sorted_embedding_cache(
+def _persist_sorted_embedding_cache_inner(
     output_dir: Path,
     results: Sequence[Dict[str, Any]],
     *,
@@ -2643,6 +2651,41 @@ def persist_sorted_embedding_cache(
         "updated_entries": int(updated),
         "total_entries": int(len(entries)),
     }
+
+
+def persist_sorted_embedding_cache(
+    output_dir: Path,
+    results: Sequence[Dict[str, Any]],
+    *,
+    use_insightface: bool,
+) -> Dict[str, Any]:
+    import time
+    cache_path = sorting_embedding_cache_path(output_dir, use_insightface=use_insightface)
+    lock_path = cache_path.with_suffix(".lock")
+    
+    for _ in range(50):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            time.sleep(0.1)
+        except OSError:
+            time.sleep(0.1)
+    else:
+        print("[WARN] Could not acquire cache lock. Data may be overwritten.", flush=True)
+
+    try:
+        return _persist_sorted_embedding_cache_inner(
+            output_dir=output_dir,
+            results=results,
+            use_insightface=use_insightface,
+        )
+    finally:
+        try:
+            os.remove(str(lock_path))
+        except OSError:
+            pass
 
 
 def build_per_video_report_rows(results: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3258,6 +3301,7 @@ def process_video(video_path: str, prefetched_video: Optional[PrefetchedVideo] =
                             flush=True,
                         )
                         break
+
 
         if not has_verified_female_candidate(first_ts, first_box, first_embedding, first_gender_label, first_gender_conf):
             seed_hits = int(scan_info.get("female_seed_hits", 0))
